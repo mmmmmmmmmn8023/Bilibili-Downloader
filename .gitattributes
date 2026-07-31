@@ -1,0 +1,10 @@
+# 自动识别文本文件，提交时统一规范化为 LF，检出时按平台还原
+* text=auto
+
+# Windows 批处理文件必须保留 CRLF，否则无法执行
+*.bat text eol=crlf
+
+# 明确标记二进制，避免被当作文本处理导致损坏
+*.exe binary
+*.dll binary
+*.so binary

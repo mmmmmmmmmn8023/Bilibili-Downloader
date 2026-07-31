@@ -1,0 +1,20 @@
+# 运行环境
+.venv/
+__pycache__/
+*.pyc
+
+# 隐私 / 个人数据（含登录态 SESSDATA，切勿提交）
+config.json
+download_history.json
+
+# 运行时产物
+logs/
+downloads/
+
+# 助手工作记忆（与项目无关）
+.workbuddy/
+
+# 系统 / 编辑器
+.DS_Store
+Thumbs.db
+*.swp
