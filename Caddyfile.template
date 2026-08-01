@@ -1,0 +1,17 @@
+# 本文件由 deploy.sh 从模板生成（替换 __DOMAIN__ / __AUTH_USER__ / __HASH__ / __ADMIN_EMAIL__）
+# 如需使用自有证书，请参考 DEPLOY.md 的 FAQ 修改此处
+
+{
+    # 证书申请邮箱（Let's Encrypt 用于证书过期通知）
+    email __ADMIN_EMAIL__
+}
+
+__DOMAIN__ {
+    # 全站 Basic Auth：公网唯一防线（Web 界面本身无内置登录）
+    basicauth / {
+        __AUTH_USER__ __HASH__
+    }
+
+    # 反代到内部 app 服务
+    reverse_proxy app:8000
+}

@@ -1,0 +1,54 @@
+# 生产部署编排（公网 + 域名 + 鉴权）
+# 拓扑：浏览器 → Caddy(443 + Basic Auth) → app(仅内部 8000) → 持久化卷
+#
+# 用法：
+#   1. cp .env.example .env        # 填 DOMAIN / AUTH_USER / AUTH_PASS / ADMIN_EMAIL
+#   2. chmod +x deploy.sh && ./deploy.sh
+#
+# 说明：
+#   - app 仅 expose 8000（内部网络），不映射公网端口
+#   - 公网只经 Caddy 的 80(证书验证) / 443(HTTPS) 暴露
+#   - Web 界面无内置登录，全靠 Caddy 的 Basic Auth 作公网唯一防线
+
+services:
+  app:
+    build: .
+    image: bilibili-downloader:latest
+    container_name: bilibili-downloader
+    environment:
+      - PORT=8000
+    # 仅内部暴露，绝不映射公网端口
+    expose:
+      - "8000"
+    volumes:
+      - ./downloads:/app/downloads
+      - ./config.json:/app/config.json
+      - ./download_history.json:/app/download_history.json
+      - ./logs:/app/logs
+    restart: unless-stopped
+    networks:
+      - internal
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: bilibili-caddy
+    ports:
+      - "80:80"     # 仅用于 ACME 证书申请 / 续期验证
+      - "443:443"   # 公网 HTTPS 入口
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile
+      - caddy_data:/data      # 证书存储（切勿删除，否则需重新申请）
+      - caddy_config:/config
+    depends_on:
+      - app
+    restart: unless-stopped
+    networks:
+      - internal
+
+networks:
+  internal:
+    driver: bridge
+
+volumes:
+  caddy_data:
+  caddy_config:
