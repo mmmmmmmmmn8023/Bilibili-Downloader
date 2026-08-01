@@ -35,7 +35,7 @@ touch config.json download_history.json 2>/dev/null || true
 
 echo "==> [3/5] 生成 Basic Auth 密码哈希"
 # 使用官方 caddy 镜像临时计算哈希，不污染宿主机
-HASH=$(docker run --rm caddy:2-alpine caddy hash-password "$AUTH_PASS" 2>/dev/null)
+HASH=$(docker run --rm caddy:2-alpine caddy hash-password --plaintext "$AUTH_PASS")
 if [ -z "$HASH" ]; then
   echo "错误：生成密码哈希失败（可能拉取 caddy 镜像失败，请检查网络）"
   exit 1
