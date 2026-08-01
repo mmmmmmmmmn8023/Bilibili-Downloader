@@ -17,6 +17,8 @@ services:
     container_name: bilibili-downloader
     environment:
       - PORT=8000
+      # 必须监听所有网卡，否则同网络内 Caddy 反代 app:8000 会 connection refused
+      - BIND_HOST=0.0.0.0
     # 仅内部暴露，绝不映射公网端口
     expose:
       - "8000"
