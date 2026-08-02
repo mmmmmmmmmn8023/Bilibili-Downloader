@@ -1605,6 +1605,31 @@
     .self-card .sc-owner { font-size: 12px; color: #7d8590; }
     .self-card .dy-actions { margin-top: auto; display: flex; gap: 8px; justify-content: flex-end; }
     .hidden { display: none; }
+
+    /* ===== 作者信息页脚（方案 C：卡片胶囊） ===== */
+    .app-footer {
+      margin-top: 48px;
+      padding: 28px 16px 36px;
+      text-align: center;
+    }
+    .app-footer .footer-card {
+      display: inline-flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: center;
+      gap: 10px;
+      padding: 12px 22px;
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 999px;
+      font-size: 13px;
+      color: #8b949e;
+      box-shadow: 0 4px 16px rgba(0,0,0,0.3);
+    }
+    .app-footer .footer-brand { color: #fb7299; font-weight: 700; }
+    .app-footer .footer-sep { color: #30363d; }
+    .app-footer a { color: #58a6ff; text-decoration: none; }
+    .app-footer a:hover { text-decoration: underline; }
   </style>
 </head>
 <body>
@@ -1968,6 +1993,19 @@
     <img id="imgPreviewImg" src="" alt="">
   </div>
 
-  <script src="/static/app.js?v=20260802-43"></script>
+  <!-- 作者信息页脚（方案 C：卡片胶囊） -->
+  <footer class="app-footer">
+    <div class="footer-card">
+      <span class="footer-brand">B站下载器</span>
+      <span class="footer-sep">·</span>
+      <span><a href="https://space.bilibili.com/2232517" target="_blank" rel="noopener">好chi</a></span>
+      <span class="footer-sep">·</span>
+      <a href="https://github.com/mmmmmmmmmn8023/Bilibili-Downloader" target="_blank" rel="noopener">GitHub</a>
+      <span class="footer-sep">·</span>
+      <a href="mailto:mmmmmmmmmn8023@qq.com">联系邮箱</a>
+    </div>
+  </footer>
+
+  <script src="/static/app.js?v=20260803-44"></script>
 </body>
 </html>
