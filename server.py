@@ -13,6 +13,7 @@ import os
 import json
 import uuid
 import time
+import base64
 import threading
 import logging
 from logging.handlers import TimedRotatingFileHandler
@@ -26,6 +27,13 @@ from bilibili import (
     BilibiliAPI, download_tasks, update_task, sanitize_filename, dyn_folder_type_from_dynamic,
     DownloadCancelled, cancel_task, is_cancelled, clear_cancel, _classify_error,
 )
+
+try:
+    import qrcode
+    from io import BytesIO
+    _QR_AVAILABLE = True
+except Exception:
+    _QR_AVAILABLE = False
 
 # ========================================================
 # 配置
@@ -84,6 +92,16 @@ _executor_lock = threading.Lock()
 DEFAULT_MAX_CONCURRENT = 2          # 默认同时下载数量（用户可在设置里调）
 TASK_KEEP_DONE = 50                 # 自动清理后保留的已完成任务上限
 TASK_AUTO_CLEANUP_THRESHOLD = 150   # 任务总数超过此值时触发自动清理
+
+# ========================================================
+# 扫码登录状态（内存态，重启即丢，符合「本地临时票据」语义）
+#   _qr_state: {qrcode_key, image, expires_at, last_status, last_message}
+#   expires_at 用于前端倒计时与后端过期判定（B站 默认 180 秒）
+# ========================================================
+_qr_lock = threading.Lock()
+_qr_state = {"qrcode_key": None, "image": None, "expires_at": 0, "last_status": None, "last_message": ""}
+QR_TTL = 180  # 秒，B站 二维码有效期
+
 
 
 def get_max_concurrent():
@@ -748,6 +766,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._api_auto_log(params)
             elif path == "/api/logs/download":
                 self._api_logs_download()
+            elif path == "/api/qr/status":
+                self._api_qr_status()
             else:
                 self._json({"error": "Not found"}, 404)
         except Exception as e:
@@ -782,6 +802,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._api_retry_task(data)
             elif path == "/api/tasks/clear":
                 self._api_clear_tasks(data)
+            elif path == "/api/qr/generate":
+                self._api_qr_generate()
+            elif path == "/api/qr/poll":
+                self._api_qr_poll(data)
             else:
                 self._json({"error": "Not found"}, 404)
         except Exception as e:
@@ -823,12 +847,17 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(content)
 
     def _json(self, data, code=200):
-        content = json.dumps(data, ensure_ascii=False).encode("utf-8")
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(content)))
-        self.end_headers()
-        self.wfile.write(content)
+        try:
+            content = json.dumps(data, ensure_ascii=False).encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(content)))
+            self.end_headers()
+            self.wfile.write(content)
+        except (ConnectionAbortedError, BrokenPipeError, ConnectionResetError):
+            # 客户端在响应写完前断开连接（如刷新/关闭页面/取消请求），
+            # 属正常网络抖动，静默忽略，不刷 traceback
+            pass
 
     def _read_body(self):
         length = int(self.headers.get("Content-Length", 0))
@@ -1614,6 +1643,99 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._json({"folders": folders})
 
+    # ---- 扫码登录（二维码）----
+
+    def _api_qr_generate(self):
+        """生成登录二维码：返回 base64 PNG 图片 + 票据 key。
+        若 qrcode 库缺失，返回 qr_unavailable 提示前端改用 Cookie 输入。
+        """
+        if not _QR_AVAILABLE:
+            self._json({"qr_unavailable": True,
+                        "error": "后端未安装 qrcode 库，无法生成二维码，请使用 Cookie 登录"})
+            return
+        try:
+            api = BilibiliAPI()
+            gen = api.qr_generate()
+            qr = qrcode.QRCode(box_size=8, border=2,
+                               error_correction=qrcode.constants.ERROR_CORRECT_M)
+            qr.add_data(gen["url"])
+            qr.make(fit=True)
+            img = qr.make_image(fill_color="black", back_color="white")
+            buf = BytesIO()
+            img.save(buf, format="PNG")
+            b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+            with _qr_lock:
+                _qr_state["qrcode_key"] = gen["qrcode_key"]
+                _qr_state["image"] = b64
+                _qr_state["expires_at"] = time.time() + QR_TTL
+                _qr_state["last_status"] = "scanning"
+                _qr_state["last_message"] = "等待扫码"
+            self._json({"ok": True, "qrcode_key": gen["qrcode_key"],
+                        "image": b64, "expires_in": QR_TTL})
+        except Exception as e:
+            self._json({"ok": False, "error": str(e)})
+
+    def _api_qr_poll(self, data):
+        """轮询扫码状态。前端传入 qrcode_key（或直接用服务端缓存的）。
+        成功时把完整 cookie 同步进配置（sessdata 取 SESSDATA 值），并回传登录信息。
+        """
+        key = (data or {}).get("qrcode_key") or _qr_state.get("qrcode_key")
+        if not key:
+            self._json({"ok": False, "error": "请先生成二维码"})
+            return
+        try:
+            api = BilibiliAPI()
+            res = api.qr_poll(key)
+        except Exception as e:
+            self._json({"ok": False, "error": str(e)})
+            return
+
+        with _qr_lock:
+            _qr_state["last_status"] = res["status"]
+            _qr_state["last_message"] = res.get("message", "")
+
+        if res["status"] == "success" and res.get("cookie"):
+            cookie = res["cookie"]
+            # 解析 SESSDATA 值（兼容将来多字段并存），写入 config.sessdata
+            sess = ""
+            for part in cookie.split(";"):
+                part = part.strip()
+                if part.startswith("SESSDATA="):
+                    sess = part[len("SESSDATA="):]
+                    break
+            cfg = load_config()
+            if not sess:
+                # 理论上不会走到这里（qr_poll 已校验 cookie 含 SESSDATA）
+                self._json({"ok": False, "error": "登录成功但未取到 SESSDATA，登录态无效"})
+                return
+            # sessdata 字段只存 SESSDATA 的值本身（不含 "SESSDATA=" 前缀），
+            # 其它接口自行拼 "SESSDATA=" + 值；不再兜底存整串，避免混入其它字段。
+            cfg["sessdata"] = sess
+            save_config(cfg)
+            bilibili.VERIFY_SSL = not cfg.get("insecure_tls", True)
+            # 用新 cookie 取登录信息，回传前端
+            info = BilibiliAPI(cookie).get_self_info() if cookie else {"login": False}
+            self._json({"ok": True, "status": "success", "cookie": cookie,
+                        "sessdata": sess, "self": info})
+            return
+
+        # 未成功：回传当前状态（含失效/待确认/未扫码）
+        self._json({"ok": True, "status": res["status"],
+                    "message": res.get("message", ""),
+                    "code": res.get("code")})
+
+    def _api_qr_status(self):
+        """查询当前二维码的剩余有效期与最近状态（供前端刷新倒计时/过期判定）。"""
+        with _qr_lock:
+            expires = _qr_state.get("expires_at", 0)
+            remain = max(0, int(expires - time.time()))
+            self._json({
+                "ok": True,
+                "has_qr": bool(_qr_state.get("qrcode_key")),
+                "expires_in": remain,
+                "status": _qr_state.get("last_status"),
+            })
+
     def _preflight_check(self, cookie):
         """下载前预检 SESSDATA 有效性。
         返回错误提示字符串（应直接拦截下载）；返回 None 表示可继续。
@@ -1645,9 +1767,8 @@ def main():
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
     # 根据配置初始化 TLS 校验开关（默认 insecure_tls=true → 不校验，兼容代理/抓包）
     bilibili.VERIFY_SSL = not load_config().get("insecure_tls", True)
-    # 监听地址：默认仅本机 127.0.0.1（安全）；Docker/局域网可通过环境变量
-    # BIND_HOST 或配置项 host 改为 0.0.0.0
-    host = os.environ.get("BIND_HOST") or load_config().get("host") or "127.0.0.1"
+    # 监听地址：默认仅本机 127.0.0.1（安全，不对外暴露）
+    host = load_config().get("host") or "127.0.0.1"
     server = ThreadingHTTPServer((host, PORT), Handler)
     print("=" * 50)
     print("  B站下载器 已启动！")

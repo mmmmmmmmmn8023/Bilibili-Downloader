@@ -2142,6 +2142,164 @@ async function verifyCookie() {
   }
 }
 
+// ==================== 扫码登录（二维码）====================
+
+let qrTimer = null;       // 轮询定时器
+let qrCountdownTimer = null; // 倒计时定时器
+let qrKey = "";            // 当前票据 key
+// 轮询间隔（秒）：未扫/已扫均 2 秒，避免过频触发风控
+const QR_POLL_INTERVAL = 2000;
+
+function openQrModal() {
+  // 先关闭 Cookie 弹窗，避免两个弹窗叠加 / 关 Cookie 弹窗时连带隐藏扫码弹窗
+  closeCookieModal();
+  document.getElementById("qrModal").classList.add("show");
+  refreshQr();
+}
+
+function closeQrModal() {
+  document.getElementById("qrModal").classList.remove("show");
+  stopQrPolling();
+}
+
+function stopQrPolling() {
+  if (qrTimer) { clearInterval(qrTimer); qrTimer = null; }
+  if (qrCountdownTimer) { clearInterval(qrCountdownTimer); qrCountdownTimer = null; }
+}
+
+// 生成新二维码：调后端 /api/qr/generate，拿到 base64 PNG + key，启动轮询
+async function refreshQr() {
+  stopQrPolling();
+  const loading = document.getElementById("qrLoading");
+  const img = document.getElementById("qrImg");
+  const expiredTip = document.getElementById("qrExpiredTip");
+  const statusEl = document.getElementById("qrStatus");
+  const cdEl = document.getElementById("qrCountdown");
+  loading.style.display = "block";
+  img.style.display = "none";
+  expiredTip.style.display = "none";
+  statusEl.textContent = "正在生成二维码…";
+  cdEl.textContent = "";
+  try {
+    const resp = await fetch("/api/qr/generate", { method: "POST" });
+    const d = await resp.json();
+    if (d.qr_unavailable) {
+      statusEl.textContent = "⚠ " + (d.error || "二维码不可用");
+      loading.style.display = "none";
+      return;
+    }
+    if (!d.ok) {
+      statusEl.textContent = "⚠ " + (d.error || "生成失败");
+      loading.style.display = "none";
+      return;
+    }
+    qrKey = d.qrcode_key;
+    img.src = "data:image/png;base64," + d.image;
+    img.style.display = "block";
+    loading.style.display = "none";
+    statusEl.textContent = "等待扫码…";
+    startQrPolling();
+    startQrCountdown(d.expires_in || 180);
+  } catch (e) {
+    loading.style.display = "none";
+    statusEl.textContent = "⚠ 生成失败: " + e.message;
+  }
+}
+
+function startQrPolling() {
+  stopQrPolling();
+  qrTimer = setInterval(pollQr, QR_POLL_INTERVAL);
+}
+
+// 倒计时显示（从 /api/qr/status 取剩余秒数，保证与服务端一致）
+async function startQrCountdown(initial) {
+  let remain = initial;
+  const cdEl = document.getElementById("qrCountdown");
+  if (cdEl) cdEl.textContent = `二维码有效剩余 ${remain}s`;
+  try {
+    const r = await fetch("/api/qr/status");
+    const s = await r.json();
+    if (typeof s.expires_in === "number" && s.expires_in > 0) remain = s.expires_in;
+  } catch (e) { /* 取不到则用 initial */ }
+  if (qrCountdownTimer) clearInterval(qrCountdownTimer);
+  qrCountdownTimer = setInterval(() => {
+    remain--;
+    if (remain <= 0) {
+      if (cdEl) cdEl.textContent = "二维码已失效";
+      stopQrPolling();
+      const expiredTip = document.getElementById("qrExpiredTip");
+      const img = document.getElementById("qrImg");
+      if (img) img.style.display = "none";
+      if (expiredTip) expiredTip.style.display = "block";
+      const statusEl = document.getElementById("qrStatus");
+      if (statusEl) statusEl.textContent = "二维码已失效，请刷新";
+      return;
+    }
+    if (cdEl) cdEl.textContent = `二维码有效剩余 ${remain}s`;
+  }, 1000);
+}
+
+async function pollQr() {
+  const statusEl = document.getElementById("qrStatus");
+  try {
+    const resp = await fetch("/api/qr/poll", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ qrcode_key: qrKey }),
+    });
+    const d = await resp.json();
+    if (!d.ok && d.error) {
+      statusEl.textContent = "⚠ " + d.error;
+      stopQrPolling();
+      return;
+    }
+    const status = d.status;
+    if (status === "scanning") {
+      statusEl.textContent = "等待扫码…";
+    } else if (status === "confirming") {
+      statusEl.textContent = "✅ 已扫码，请在手机上确认登录";
+    } else if (status === "expired") {
+      statusEl.textContent = "二维码已失效，请刷新";
+      stopQrPolling();
+      const expiredTip = document.getElementById("qrExpiredTip");
+      const img = document.getElementById("qrImg");
+      if (img) img.style.display = "none";
+      if (expiredTip) expiredTip.style.display = "block";
+    } else if (status === "success") {
+      // 登录成功：后端已把“纯值” sessdata 写入配置。
+      // 注意：必须用后端返回的纯值 d.sessdata 存储，绝不能把整串 d.cookie
+      // 塞进 cookieInput 再调 saveCookie()——saveCookie 会把整串（含 SESSDATA= 前缀）
+      // 写回 sessdata，覆盖掉纯值（这是此前“sessdata 仍带前缀”的根因）。
+      stopQrPolling();
+      const sess = d.sessdata || "";
+      cookie = sess;                       // 全局 cookie 变量用纯值（与手动粘贴约定一致）
+      const input = document.getElementById("cookieInput");
+      if (input) input.value = sess;       // 输入框也只放纯值
+      // 持久化纯值到服务端（绕过 saveCookie 的整串逻辑，直接 POST 纯值）
+      try {
+        localStorage.setItem("bilibili_sessdata", sess);
+        await fetch("/api/config", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ sessdata: sess }),
+        });
+      } catch (e) { /* 忽略持久化失败 */ }
+      // 先提示用户“登录成功”，延迟再关弹窗，避免成功提示一闪而过
+      statusEl.textContent = "🎉 登录成功！正在刷新…";
+      setTimeout(async () => {
+        closeQrModal();
+        await loadSelfChip();
+        if (d.self && d.self.name) {
+          const chip = document.getElementById("selfChip");
+          if (chip) chip.style.display = "flex";
+        }
+      }, 1200);
+    }
+  } catch (e) {
+    // 轮询失败（网络抖动）忽略，下一轮继续
+  }
+}
+
 // ==================== 图片预览 ====================
 
 function previewImage(url) {

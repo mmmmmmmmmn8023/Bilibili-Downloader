@@ -13,8 +13,5 @@ downloads/
 
 # 助手工作记忆（与项目无关）
 .workbuddy/
+.codebuddy/
 
-# 系统 / 编辑器
-.DS_Store
-Thumbs.db
-*.swp

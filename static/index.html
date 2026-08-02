@@ -1778,12 +1778,41 @@
         <input type="checkbox" id="rememberCookie" checked>
         记住 SESSDATA（下次打开自动填充）
       </label>
+      <div style="text-align:center;margin:-6px 0 12px;font-size:12px;color:#484f58;">— 或 —</div>
+      <button class="btn-primary" style="width:100%;margin-bottom:14px;" onclick="openQrModal()">📱 扫码登录</button>
       <div class="modal-actions">
         <button class="btn-secondary" onclick="closeCookieModal()">取消</button>
         <button class="btn-primary" onclick="saveCookie()">保存</button>
       </div>
     </div>
   </div>
+
+  <!-- 扫码登录弹窗 -->
+  <div class="modal-overlay" id="qrModal" onclick="if(event.target===this)closeQrModal()">
+    <div class="modal" style="width:360px;text-align:center;">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;">
+        <h3 style="margin-bottom:0;">扫码登录 B站</h3>
+        <button class="history-close" onclick="closeQrModal()" title="关闭">&times;</button>
+      </div>
+      <p class="cookie-hint" style="margin-bottom:14px;">
+        打开 B站 App → 扫一扫，扫描下方二维码确认登录
+      </p>
+      <div id="qrBox" style="display:flex;align-items:center;justify-content:center;min-height:220px;background:#fff;border-radius:10px;padding:12px;">
+        <div class="spinner" id="qrLoading"></div>
+        <img id="qrImg" src="" alt="登录二维码" style="display:none;max-width:200px;height:auto;">
+        <div id="qrExpiredTip" style="display:none;color:#f0883e;font-size:14px;line-height:1.6;">
+          二维码已失效<br>请点击「刷新二维码」重新获取
+        </div>
+      </div>
+      <div id="qrStatus" style="margin:12px 0 4px;font-size:14px;color:#7d8590;">等待扫码…</div>
+      <div id="qrCountdown" style="font-size:12px;color:#6e7681;margin-bottom:12px;"></div>
+      <div class="modal-actions" style="justify-content:center;">
+        <button class="btn-secondary" onclick="closeQrModal()">关闭</button>
+        <button class="btn-primary" id="qrRefreshBtn" onclick="refreshQr()">刷新二维码</button>
+      </div>
+    </div>
+  </div>
+
 
   <!-- 下载设置弹窗（画质 + 保存位置 + 命名方式） -->
   <div class="modal-overlay" id="dlModal">
@@ -1915,6 +1944,6 @@
     <img id="imgPreviewImg" src="" alt="">
   </div>
 
-  <script src="/static/app.js?v=20260729-40"></script>
+  <script src="/static/app.js?v=20260802-41"></script>
 </body>
 </html>

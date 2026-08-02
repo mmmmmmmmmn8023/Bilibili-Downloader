@@ -1,10 +1,10 @@
 # B站下载器
 
-本地 B站 视频 / 动态下载工具。搜索 UP主即可批量下载投稿视频与图文动态，支持自动化定时监控、下载历史记录与自定义命名。
+B站 视频 / 动态下载工具。搜索 UP主即可批量下载投稿视频与图文动态，支持自动化定时监控、下载历史记录与自定义命名。
 
-![License](https://img.shields.io/badge/license-Apache%202.0-blue) ![Python](https://img.shields.io/badge/python-3.13%2B-blue) ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Docker-lightgrey)
+![License](https://img.shields.io/badge/license-Apache%202.0-blue) ![Python](https://img.shields.io/badge/python-3.13%2B-blue) ![Platform](https://img.shields.io/badge/platform-Windows-lightgrey)
 
-> **注意**：本项目为**本地单机工具**，默认仅监听 `127.0.0.1`（本机），不对外暴露。请勿在不可信网络中将其绑定到 `0.0.0.0`。
+> **注意**：本分支为**本地单机工具**，默认仅监听 `127.0.0.1`（本机），不对外暴露。
 
 ## 功能
 
@@ -16,6 +16,7 @@
 - 自动化定时监控下载
 - 下载历史记录（按 UP主 分组，可去重）
 - 下载失败自动重试、速度 / 进度展示
+- **扫码登录**：B站 App 扫二维码一键登录，免手动复制 Cookie
 
 ## 快速开始
 
@@ -49,11 +50,23 @@ FFmpeg 已内置在 `ffmpeg/` 目录（Windows）。其它平台会从系统 `PA
 | `auto_schedule_enabled` / `auto_interval` | 定时检查开关与间隔（秒）                                              |
 | `proxy` / `speed_limit`                   | 下载代理 / 限速（KB/s）                                           |
 | `insecure_tls`                            | 默认 `true`（不校验 TLS 证书，兼容代理 / 抓包）；在不受信任网络建议设 `false` 开启严格校验 |
-| `host`                                    | 监听地址，默认 `127.0.0.1`；Docker 用环境变量 `BIND_HOST=0.0.0.0` 覆盖   |
+| `host`                                    | 监听地址，默认 `127.0.0.1`（本机），不对外暴露                       |
 
 ### 获取 SESSDATA
 
 浏览器登录 B站 → F12 → Application → Cookies → 复制 `SESSDATA` 的值，在界面右上角设置中粘贴即可（无 Cookie 时画质限制 480P）。
+
+### 扫码登录（推荐）
+
+不想手动复制 Cookie？可以用扫码登录：
+
+1. 打开界面右上角设置 → 设置 SESSDATA（Cookie）→ 点击 **📱 扫码登录**。
+2. 弹窗显示二维码，**用 B站 App 扫一扫** 并确认登录。
+3. 登录成功后，后端从扫码返回中提取 `SESSDATA` 纯值并写入 `config.json` 的 `sessdata` 字段（与手动粘贴等效），无需任何手动粘贴。
+
+二维码有效期 180 秒，过期后点击「刷新二维码」重新获取即可。后端用 `qrcode` 库生成 PNG 图片（依赖 `Pillow`），前端直接展示，无额外前端依赖。
+
+> 扫码登录与手动粘贴 SESSDATA 等效：两者都只把 `SESSDATA` 纯值（不含 `SESSDATA=` 前缀）存入 `config.json` 的 `sessdata` 字段。
 
 ## 目录结构
 
@@ -63,9 +76,7 @@ bilibili.py           B站 API 调用与下载逻辑
 static/               前端页面（index.html / app.js）
 ffmpeg/               内置 FFmpeg（Windows）
 start.bat             Windows 一键启动
-requirements.txt      依赖（curl_cffi）
-Dockerfile            容器构建
-docker-compose.yml    容器编排
+requirements.txt      依赖（curl_cffi / qrcode / Pillow）
 config.json           运行配置（自动生成，勿提交）
 download_history.json 下载历史（自动生成，勿提交）
 logs/                 运行日志（自动生成）
@@ -109,6 +120,9 @@ logs/                 运行日志（自动生成）
 | `/api/download/cancel`  | 取消任务         |
 | `/api/download/retry`   | 重试任务         |
 | `/api/tasks/clear`      | 清理任务列表       |
+| `/api/qr/generate`      | 生成登录二维码（返回 base64 PNG + key） |
+| `/api/qr/poll`          | 轮询扫码状态（成功返回完整 Cookie）    |
+| `/api/qr/status`        | 查询二维码剩余有效期与状态          |
 
 ## 自动化监控
 
