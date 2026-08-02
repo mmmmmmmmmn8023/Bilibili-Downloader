@@ -1,0 +1,15 @@
+services:
+  bilibili-downloader:
+    build: .
+    container_name: bilibili-downloader
+    # 容器内监听 0.0.0.0，使宿主机可经端口映射访问
+    environment:
+      - BIND_HOST=0.0.0.0
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+    volumes:
+      - ./downloads:/app/downloads
+      - ./config.json:/app/config.json
+      - ./download_history.json:/app/download_history.json
+      - ./logs:/app/logs

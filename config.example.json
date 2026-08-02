@@ -1,0 +1,17 @@
+{
+  "download_dir": "",
+  "folder_template": "dynType/pubdate-avTitle",
+  "file_template": "avTitle-UpName-bvid-pubdate",
+  "max_duration": 20,
+  "download_threads": 3,
+  "qn": 127,
+  "download_types": [],
+  "sessdata": "",
+  "auto_uids": [],
+  "auto_schedule_enabled": false,
+  "auto_interval": 1800,
+  "proxy": "",
+  "speed_limit": 0,
+  "insecure_tls": true,
+  "host": "127.0.0.1"
+}
