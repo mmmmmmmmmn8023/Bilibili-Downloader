@@ -358,6 +358,9 @@ def render_template(template, variables):
         s = str(v) if v is not None else ""
         s = _re.sub(r"[\x00-\x1f\u3000\xa0]", "_", s)
         s = _re.sub(r'[\\/:*?"<>|#%&：？＊＂＇＜＞｜＼／]', "_", s)
+        # 方案二：命名模板变量层把 emoji 替换为字面符号 [emoji]
+        # （仅影响进入文件名/目录名的变量值；用户名/收藏夹名目录前缀走 sanitize_filename，不受影响）
+        s = _re.sub(r"[\U0001F000-\U0001FAFF\u2600-\u27BF\u2190-\u21FF\u2B00-\u2BFF\uFE0F\u200D]", "[emoji]", s)
         return s
     # 单遍 re.sub + 单词边界，避免旧循环 replace 导致标题中的变量子串被二次替换
     _token_re = _re.compile(
@@ -1220,6 +1223,81 @@ class BilibiliAPI:
             pass
         return {"login": False, "uid": 0, "name": "", "face": "", "level": 0}
 
+    # -------------------- 扫码登录（二维码）--------------------
+
+    def qr_generate(self):
+        """生成 B站 二维码登录票据。
+
+        调用 passport 的 qrcode/generate 接口拿到：
+          - qrcode_key：32位密钥（轮询时用，180秒超时）
+          - url：二维码内容（需编码成图片给用户扫）
+        返回 dict: {qrcode_key, url}
+        失败抛出 Exception（含友好原因）。
+        """
+        try:
+            resp = self.session.get(
+                "https://passport.bilibili.com/x/passport-login/web/qrcode/generate",
+                timeout=10, verify=VERIFY_SSL,
+            )
+            data = resp.json()
+        except Exception as e:
+            raise Exception(f"获取登录二维码失败（网络错误）: {e}")
+        if data.get("code") != 0:
+            raise Exception(f"获取登录二维码失败: {data.get('message', '未知错误')}")
+        d = data.get("data") or {}
+        key = d.get("qrcode_key")
+        url = d.get("url")
+        if not key or not url:
+            raise Exception("获取登录二维码失败：返回数据缺少 qrcode_key / url")
+        return {"qrcode_key": key, "url": url}
+
+    def qr_poll(self, qrcode_key):
+        """轮询扫码状态。
+
+        code 含义：
+          0    成功（data.url 里含登录态 cookie，从响应头 set-cookie 提取完整 cookie 串）
+          86038 二维码已失效（需重新生成）
+          86090 已扫码，待确认
+          86101 未扫码
+        返回 dict:
+          {code(int), status(str: 'scanning'|'confirming'|'expired'|'success'|'unknown'),
+           message(str), cookie(str|None)}
+        cookie 仅在成功时返回完整 cookie 串（SESSDATA;bili_jct;DedeUserID...）。
+        """
+        try:
+            resp = self.session.get(
+                "https://passport.bilibili.com/x/passport-login/web/qrcode/poll",
+                params={"qrcode_key": qrcode_key},
+                timeout=10, verify=VERIFY_SSL,
+            )
+            data = resp.json()
+        except Exception as e:
+            raise Exception(f"轮询扫码状态失败（网络错误）: {e}")
+        code = data.get("code")
+        msg = data.get("message", "")
+        # 从响应头 set-cookie 提取完整 cookie 串（仅成功时服务端会下发）
+        cookie = None
+        if code == 0:
+            cookie = _extract_cookie_from_headers(resp.headers)
+            # 关键收紧：B站 在部分情况下（如已登录态复用、仅下发 buvid 指纹）
+            # 即便未真正扫码确认也会返回 code=0，但 cookie 里没有 SESSDATA。
+            # 必须以“拿到 SESSDATA 登录态”作为成功判据，否则视为未扫码继续轮询。
+            if not cookie or "SESSDATA=" not in cookie:
+                code = 86101  # 回退为“未扫码”，继续轮询
+                cookie = None
+        # 状态码 → 友好分类（与官方定义一致）
+        if code == 0:
+            status = "success"
+        elif code == 86090:
+            status = "confirming"
+        elif code == 86038:
+            status = "expired"
+        elif code == 86101:
+            status = "scanning"
+        else:
+            status = "unknown"
+        return {"code": code, "status": status, "message": msg, "cookie": cookie}
+
     def get_watch_later(self, page_size=40):
         """获取登录用户的『稍后再看』列表（需登录）。
         返回标准化视频列表：[{aid,bvid,title,cover,duration,owner_name,owner_mid,pubdate,view,progress}]
@@ -2040,6 +2118,52 @@ class BilibiliAPI:
             return out_dir
 
         raise Exception(f"暂不支持下载此类型动态: {dtype}")
+
+
+def _extract_cookie_from_headers(headers):
+    """从响应头的 set-cookie 列表里拼出完整 cookie 字符串。
+
+    解析规则：每条 set-cookie 形如 `NAME=VALUE; Expires=...; Path=/; ...`。
+    取「第一个分号 ; 之前」的 NAME=VALUE 作为真实 cookie（Expires 里的
+    逗号/ GMT 日期不会被误当成 cookie 名），并丢弃 HttpOnly/Secure/SameSite/
+    Path/Domain/Max-Age/Expires 等属性。
+    注意：不能用 http.cookies.SimpleCookie——它对含 % * 等特殊字符的
+    SESSDATA 值会校验失败整条丢弃。故采用宽松的首段解析。
+    优先保留 SESSDATA / bili_jct / DedeUserID 等关键登录态字段。
+    """
+    try:
+        raw = headers.get_all("set-cookie") if hasattr(headers, "get_all") else None
+        if not raw:
+            # http.client / 兼容：headers 可能是 dict-like，逐行取 set-cookie
+            single = headers.get("set-cookie") if hasattr(headers, "get") else None
+            raw = [single] if single else []
+        cookies = {}
+        skip = {"httponly", "secure", "samesite", "path", "domain", "max-age", "expires"}
+        for item in raw:
+            # 按分号切分属性，第一个片段即 NAME=VALUE
+            first = str(item).split(";", 1)[0].strip()
+            if not first or "=" not in first:
+                continue
+            name, _, val = first.partition("=")
+            name = name.strip()
+            val = val.strip()
+            if not name or not val:
+                continue
+            # 排掉纯属性键（大小写不敏感）
+            if name.lower() in skip:
+                continue
+            cookies[name] = val
+        if not cookies:
+            return None
+        # 关键字段排序靠前（纯美观，便于排查）
+        priority = ["SESSDATA", "bili_jct", "DedeUserID", "sid"]
+        def _rank(n):
+            return priority.index(n) if n in priority else len(priority)
+        items = sorted(cookies.items(), key=lambda kv: _rank(kv[0]))
+        return "; ".join(f"{k}={v}" for k, v in items)
+    except Exception:
+        return None
+
 
 def dyn_folder_type(dyn_video_type):
     """视频动态 -> 命名模板 dynType 取值。

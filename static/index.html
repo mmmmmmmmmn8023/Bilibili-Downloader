@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="referrer" content="no-referrer">
   <title>B站下载器</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 22' fill='rgb(251,114,153)'%3E%3Cpath d='M17.813 4.653h-2.853V2.36c0-.586-.467-1.06-1.043-1.06-.577 0-1.044.474-1.044 1.06v2.293H7.034V2.36c0-.586-.467-1.06-1.044-1.06-.576 0-1.043.474-1.043 1.06v2.293H2.094C.936 4.653 0 5.608 0 6.785v11.725C0 19.687.936 20.64 2.094 20.64h15.719c1.158 0 2.094-.954 2.094-2.13V6.785c0-1.177-.936-2.132-2.094-2.132zM5.13 5.84c0 .586-.467 1.06-1.043 1.06-.576 0-1.043-.474-1.043-1.06V2.36c0-.586.467-1.06 1.043-1.06.576 0 1.043.474 1.043 1.06v3.48zm12.674 0c0 .586-.467 1.06-1.043 1.06-.577 0-1.044-.474-1.044-1.06V2.36c0-.586.467-1.06 1.044-1.06.576 0 1.043.474 1.043 1.06v3.48z'/%3E%3C/svg%3E">
   <style>
     /* ===== 全局样式 ===== */
     * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -793,6 +794,19 @@
       white-space: nowrap;
     }
     .btn-direct:hover { background: #1f6feb; color: #fff; }
+    /* 卡片内「收藏」按钮（粉色描边，与收藏语义一致） */
+    .btn-favup {
+      padding: 4px 12px;
+      background: transparent;
+      border: 1px solid #fb7299;
+      border-radius: 6px;
+      color: #fb7299;
+      font-size: 12px;
+      cursor: pointer;
+      transition: 0.2s;
+      white-space: nowrap;
+    }
+    .btn-favup:hover { background: #fb7299; color: #fff; }
 
     /* 分P（多P）展开面板 */
     .btn-pages {
@@ -1038,7 +1052,7 @@
     .dl-btn.retry:hover { background: #58a6ff; color: #fff; }
     /* 完成提示 toast */
     .dl-toast {
-      position: fixed; right: 18px; bottom: 64px; z-index: 400;
+      position: fixed; right: 18px; bottom: 120px; z-index: 400;
       background: #1f6f43; color: #fff; padding: 10px 16px; border-radius: 8px;
       font-size: 13px; box-shadow: 0 4px 16px rgba(0,0,0,0.4);
       opacity: 0; transform: translateY(8px); pointer-events: none;
@@ -1064,6 +1078,14 @@
       padding: 24px;
       width: 460px;
       max-width: 90vw;
+      max-height: 92vh;
+      display: flex;
+      flex-direction: column;
+    }
+    .dl-modal-body {
+      overflow-y: auto;
+      padding-right: 6px;
+      margin-right: -6px;
     }
     .modal h3 { font-size: 16px; margin-bottom: 12px; }
     .modal p { font-size: 13px; color: #7d8590; line-height: 1.6; margin-bottom: 12px; }
@@ -1583,6 +1605,31 @@
     .self-card .sc-owner { font-size: 12px; color: #7d8590; }
     .self-card .dy-actions { margin-top: auto; display: flex; gap: 8px; justify-content: flex-end; }
     .hidden { display: none; }
+
+    /* ===== 作者信息页脚（方案 C：卡片胶囊） ===== */
+    .app-footer {
+      margin-top: 48px;
+      padding: 28px 16px 36px;
+      text-align: center;
+    }
+    .app-footer .footer-card {
+      display: inline-flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: center;
+      gap: 10px;
+      padding: 12px 22px;
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 999px;
+      font-size: 13px;
+      color: #8b949e;
+      box-shadow: 0 4px 16px rgba(0,0,0,0.3);
+    }
+    .app-footer .footer-brand { color: #fb7299; font-weight: 700; }
+    .app-footer .footer-sep { color: #30363d; }
+    .app-footer a { color: #58a6ff; text-decoration: none; }
+    .app-footer a:hover { text-decoration: underline; }
   </style>
 </head>
 <body>
@@ -1599,7 +1646,7 @@
       <span id="autoFloatText">自动下载中</span>
     </div>
     <div class="self-chip hidden" id="selfChip" onclick="openSelfView()">
-      <img class="self-chip-avatar" id="selfChipAvatar" src="" alt="" onerror="selfChipAvatarError()">
+      <img class="self-chip-avatar" id="selfChipAvatar" src="" alt="">
       <span class="self-chip-fallback hidden" id="selfChipFallback"></span>
       <span class="self-chip-name" id="selfChipName"></span>
     </div>
@@ -1778,12 +1825,41 @@
         <input type="checkbox" id="rememberCookie" checked>
         记住 SESSDATA（下次打开自动填充）
       </label>
+      <div style="text-align:center;margin:-6px 0 12px;font-size:12px;color:#484f58;">— 或 —</div>
+      <button class="btn-primary" style="width:100%;margin-bottom:14px;" onclick="openQrModal()">📱 扫码登录</button>
       <div class="modal-actions">
         <button class="btn-secondary" onclick="closeCookieModal()">取消</button>
         <button class="btn-primary" onclick="saveCookie()">保存</button>
       </div>
     </div>
   </div>
+
+  <!-- 扫码登录弹窗 -->
+  <div class="modal-overlay" id="qrModal" onclick="if(event.target===this)closeQrModal()">
+    <div class="modal" style="width:360px;text-align:center;">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;">
+        <h3 style="margin-bottom:0;">扫码登录 B站</h3>
+        <button class="history-close" onclick="closeQrModal()" title="关闭">&times;</button>
+      </div>
+      <p class="cookie-hint" style="margin-bottom:14px;">
+        打开 B站 App → 扫一扫，扫描下方二维码确认登录
+      </p>
+      <div id="qrBox" style="display:flex;align-items:center;justify-content:center;min-height:220px;background:#fff;border-radius:10px;padding:12px;">
+        <div class="spinner" id="qrLoading"></div>
+        <img id="qrImg" src="" alt="登录二维码" style="display:none;max-width:200px;height:auto;">
+        <div id="qrExpiredTip" style="display:none;color:#f0883e;font-size:14px;line-height:1.6;">
+          二维码已失效<br>请点击「刷新二维码」重新获取
+        </div>
+      </div>
+      <div id="qrStatus" style="margin:12px 0 4px;font-size:14px;color:#7d8590;">等待扫码…</div>
+      <div id="qrCountdown" style="font-size:12px;color:#6e7681;margin-bottom:12px;"></div>
+      <div class="modal-actions" style="justify-content:center;">
+        <button class="btn-secondary" onclick="closeQrModal()">关闭</button>
+        <button class="btn-primary" id="qrRefreshBtn" onclick="refreshQr()">刷新二维码</button>
+      </div>
+    </div>
+  </div>
+
 
   <!-- 下载设置弹窗（画质 + 保存位置 + 命名方式） -->
   <div class="modal-overlay" id="dlModal">
@@ -1792,52 +1868,54 @@
         <h3 style="margin-bottom:0;">下载设置</h3>
         <button class="history-close" onclick="closeDlModal()" title="关闭">&times;</button>
       </div>
-      <label style="font-size:13px;color:#7d8590;margin-bottom:4px;display:block;">下载画质</label>
-      <select id="qnSelectModal" class="qn-select-modal">
-        <option value="127">最高画质</option>
-        <option value="120">4K</option>
-        <option value="80">1080P</option>
-        <option value="64">720P</option>
-        <option value="32">480P</option>
-        <option value="16">360P</option>
-      </select>
-      <label style="font-size:13px;color:#7d8590;margin-bottom:6px;display:block;">下载类型</label>
-      <div class="type-check-group" id="typeCheckGroup">
-        <!-- 由 app.js 的 renderDownloadTypeCheckboxes() 从 DYN_CATEGORIES 动态渲染，与 TAB 栏同步 -->
-      </div>
-      <label style="font-size:13px;color:#7d8590;margin-bottom:4px;display:block;">视频时长上限 <span style="font-weight:400;">(分钟，超过不下载，0=不限)</span></label>
-      <input type="number" id="maxDurationInput" placeholder="0" min="0">
-      <label style="font-size:13px;color:#7d8590;margin-bottom:4px;display:block;">下载线程数 <span style="font-weight:400;">(1-8，多线程提速)</span></label>
-      <input type="number" id="threadCountInput" placeholder="3" min="1" max="8">
-      <label style="font-size:13px;color:#7d8590;margin-bottom:4px;display:block;">HTTP 代理 <span style="font-weight:400;">(如 http://127.0.0.1:7890)</span></label>
-      <input type="text" id="proxyInput" placeholder="留空=直连">
-      <label style="font-size:13px;color:#7d8590;margin-bottom:4px;display:block;">下载限速 <span style="font-weight:400;">(KB/s，0=不限速，限速时自动单线程)</span></label>
-      <input type="number" id="speedLimitInput" placeholder="0" min="0">
-      <label style="font-size:13px;color:#7d8590;margin-bottom:4px;display:block;">下载保存位置</label>
-      <input type="text" id="downloadDirInput" placeholder="默认：程序目录下 downloads">
-      <label style="font-size:13px;color:#7d8590;margin-bottom:4px;display:block;">文件夹命名方式 <span class="help-btn" onclick="toggleHelp('folderHelp')" title="查看变量说明">?</span></label>
-      <input type="text" id="folderTemplateInput" placeholder="默认：视频">
-      <div id="folderHelp" class="help-detail" style="display:none">
-        <strong>可用变量：</strong><br>
-        <code>uid</code> UID &nbsp; <code>UpName</code> UP主 &nbsp; <code>bvid</code> BV号(图文为空)<br>
-        <code>dynType</code> 类型 &nbsp; <code>dynamicId</code> 动态ID<br>
-        <code>pubdate</code> 日期 &nbsp; <code>pubtime</code> 时间 &nbsp; <code>qn</code> 画质(图文为空)<br><br>
-        <strong>语法：</strong><br>
-        <code>变量名</code> 直接替换 &nbsp; <code>(:变量 默认值)</code> 空时用默认 &nbsp; <code>/</code> 子文件夹<br><br>
-        <strong>示例：</strong><br>
-        <code>dynType</code> → 按类型分目录(投稿视频/图文/…) &nbsp; <code>pubdate/UpName-bvid</code> → 日期/UP主-BV号
-      </div>
-      <label style="font-size:13px;color:#7d8590;margin-bottom:4px;display:block;">文件命名方式 <span class="help-btn" onclick="toggleHelp('fileHelp')" title="查看变量说明">?</span></label>
-      <input type="text" id="fileTemplateInput" placeholder="默认：avTitle">
-      <div id="fileHelp" class="help-detail" style="display:none">
-        <strong>可用变量：</strong><br>
-        <code>avTitle</code> 标题 &nbsp; <code>UpName</code> UP主 &nbsp; <code>uid</code> UID<br>
-        <code>bvid</code> BV号(图文为空) &nbsp; <code>dynType</code> 类型 &nbsp; <code>dynamicId</code> 动态ID<br>
-        <code>pubdate</code> 日期 &nbsp; <code>pubtime</code> 时间 &nbsp; <code>qn</code> 画质(图文为空)<br><br>
-        <strong>语法：</strong><br>
-        <code>变量名</code> 直接替换 &nbsp; <code>(:变量 默认值)</code> 空时用默认 &nbsp; ⚠️ 不可用 <code>/</code> 分文件夹<br><br>
-        <strong>示例：</strong><br>
-        <code>avTitle-UpName</code> → 标题-UP主 &nbsp; <code>bvid-pubdate</code> → BV号-日期 &nbsp; <code>dynamicId</code> → 动态ID
+      <div class="dl-modal-body">
+        <label style="font-size:13px;color:#7d8590;margin-bottom:4px;display:block;">下载画质</label>
+        <select id="qnSelectModal" class="qn-select-modal">
+          <option value="127">最高画质</option>
+          <option value="120">4K</option>
+          <option value="80">1080P</option>
+          <option value="64">720P</option>
+          <option value="32">480P</option>
+          <option value="16">360P</option>
+        </select>
+        <label style="font-size:13px;color:#7d8590;margin-bottom:6px;display:block;">下载类型</label>
+        <div class="type-check-group" id="typeCheckGroup">
+          <!-- 由 app.js 的 renderDownloadTypeCheckboxes() 从 DYN_CATEGORIES 动态渲染，与 TAB 栏同步 -->
+        </div>
+        <label style="font-size:13px;color:#7d8590;margin-bottom:4px;display:block;">视频时长上限 <span style="font-weight:400;">(分钟，超过不下载，0=不限)</span></label>
+        <input type="number" id="maxDurationInput" placeholder="0" min="0">
+        <label style="font-size:13px;color:#7d8590;margin-bottom:4px;display:block;">下载线程数 <span style="font-weight:400;">(1-8，多线程提速)</span></label>
+        <input type="number" id="threadCountInput" placeholder="3" min="1" max="8">
+        <label style="font-size:13px;color:#7d8590;margin-bottom:4px;display:block;">HTTP 代理 <span style="font-weight:400;">(如 http://127.0.0.1:7890)</span></label>
+        <input type="text" id="proxyInput" placeholder="留空=直连">
+        <label style="font-size:13px;color:#7d8590;margin-bottom:4px;display:block;">下载限速 <span style="font-weight:400;">(KB/s，0=不限速，限速时自动单线程)</span></label>
+        <input type="number" id="speedLimitInput" placeholder="0" min="0">
+        <label style="font-size:13px;color:#7d8590;margin-bottom:4px;display:block;">下载保存位置</label>
+        <input type="text" id="downloadDirInput" placeholder="默认：程序目录下 downloads">
+        <label style="font-size:13px;color:#7d8590;margin-bottom:4px;display:block;">文件夹命名方式 <span class="help-btn" onclick="toggleHelp('folderHelp')" title="查看变量说明">?</span></label>
+        <input type="text" id="folderTemplateInput" placeholder="默认：视频">
+        <div id="folderHelp" class="help-detail" style="display:none">
+          <strong>可用变量：</strong><br>
+          <code>uid</code> UID &nbsp; <code>UpName</code> UP主 &nbsp; <code>bvid</code> BV号(图文为空)<br>
+          <code>dynType</code> 类型 &nbsp; <code>dynamicId</code> 动态ID<br>
+          <code>pubdate</code> 日期 &nbsp; <code>pubtime</code> 时间 &nbsp; <code>qn</code> 画质(图文为空)<br><br>
+          <strong>语法：</strong><br>
+          <code>变量名</code> 直接替换 &nbsp; <code>(:变量 默认值)</code> 空时用默认 &nbsp; <code>/</code> 子文件夹<br><br>
+          <strong>示例：</strong><br>
+          <code>dynType</code> → 按类型分目录(投稿视频/图文/…) &nbsp; <code>pubdate/UpName-bvid</code> → 日期/UP主-BV号
+        </div>
+        <label style="font-size:13px;color:#7d8590;margin-bottom:4px;display:block;">文件命名方式 <span class="help-btn" onclick="toggleHelp('fileHelp')" title="查看变量说明">?</span></label>
+        <input type="text" id="fileTemplateInput" placeholder="默认：avTitle">
+        <div id="fileHelp" class="help-detail" style="display:none">
+          <strong>可用变量：</strong><br>
+          <code>avTitle</code> 标题 &nbsp; <code>UpName</code> UP主 &nbsp; <code>uid</code> UID<br>
+          <code>bvid</code> BV号(图文为空) &nbsp; <code>dynType</code> 类型 &nbsp; <code>dynamicId</code> 动态ID<br>
+          <code>pubdate</code> 日期 &nbsp; <code>pubtime</code> 时间 &nbsp; <code>qn</code> 画质(图文为空)<br><br>
+          <strong>语法：</strong><br>
+          <code>变量名</code> 直接替换 &nbsp; <code>(:变量 默认值)</code> 空时用默认 &nbsp; ⚠️ 不可用 <code>/</code> 分文件夹<br><br>
+          <strong>示例：</strong><br>
+          <code>avTitle-UpName</code> → 标题-UP主 &nbsp; <code>bvid-pubdate</code> → BV号-日期 &nbsp; <code>dynamicId</code> → 动态ID
+        </div>
       </div>
       <div class="modal-actions">
         <button class="btn-secondary" onclick="closeDlModal()">取消</button>
@@ -1915,6 +1993,19 @@
     <img id="imgPreviewImg" src="" alt="">
   </div>
 
-  <script src="/static/app.js?v=20260729-40"></script>
+  <!-- 作者信息页脚（方案 C：卡片胶囊） -->
+  <footer class="app-footer">
+    <div class="footer-card">
+      <span class="footer-brand">B站下载器</span>
+      <span class="footer-sep">·</span>
+      <span><a href="https://space.bilibili.com/2232517" target="_blank" rel="noopener">好chi</a></span>
+      <span class="footer-sep">·</span>
+      <a href="https://github.com/mmmmmmmmmn8023/Bilibili-Downloader" target="_blank" rel="noopener">GitHub</a>
+      <span class="footer-sep">·</span>
+      <a href="mailto:mmmmmmmmmn8023@qq.com">联系邮箱</a>
+    </div>
+  </footer>
+
+  <script src="/static/app.js?v=20260803-44"></script>
 </body>
 </html>

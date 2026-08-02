@@ -1,7 +1,6 @@
 # 运行环境
 .venv/
 __pycache__/
-*.pyc
 
 # 隐私 / 个人数据（含登录态 SESSDATA，切勿提交）
 config.json
@@ -13,6 +12,7 @@ downloads/
 
 # 助手工作记忆（与项目无关）
 .workbuddy/
+.codebuddy/
 
 # 部署环境变量（含访问密码，切勿提交；.env.example 为模板可提交）
 .env
