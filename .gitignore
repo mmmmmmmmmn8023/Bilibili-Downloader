@@ -1,7 +1,6 @@
 # 运行环境
 .venv/
 __pycache__/
-*.pyc
 
 # 隐私 / 个人数据（含登录态 SESSDATA，切勿提交）
 config.json

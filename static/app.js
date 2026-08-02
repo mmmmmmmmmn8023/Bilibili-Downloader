@@ -232,19 +232,26 @@ function renderFavUps() {
   }).join("");
 }
 
+function addUp(uid, name, face) {
+  uid = String(uid || "").trim();
+  if (!uid) return;
+  const existed = favUps.some((x) => String(x.uid) === uid);
+  // 去重（按 uid）后置底
+  favUps = favUps.filter((x) => String(x.uid) !== uid);
+  favUps.push({ uid, name: name || ("UID:" + uid), face: face || "" });
+  if (favUps.length > 30) favUps = favUps.slice(-30);  // 最多保留 30 个，保留最新的末尾 30 个
+  localStorage.setItem("bilibili_fav_ups", JSON.stringify(favUps));
+  renderFavUps();
+  showToast(existed ? "已收藏过该UP主（已置底）" : "收藏成功 · " + (name || ("UID:" + uid)));
+}
+
 function addCurrentUp() {
   if (!currentData || !currentData.user || !currentData.user.uid) {
     alert("请先搜索一个UP主");
     return;
   }
   const u = currentData.user;
-  const uid = String(u.uid);
-  // 去重（按 uid）并置顶
-  favUps = favUps.filter((x) => String(x.uid) !== uid);
-  favUps.unshift({ uid, name: u.name || ("UID:" + uid), face: u.face || "" });
-  if (favUps.length > 30) favUps = favUps.slice(0, 30);  // 最多保留 30 个
-  localStorage.setItem("bilibili_fav_ups", JSON.stringify(favUps));
-  renderFavUps();
+  addUp(u.uid, u.name, u.face);
 }
 
 function removeFavUp(uid) {
@@ -2385,7 +2392,7 @@ async function loadSelfChip() {
       const av = document.getElementById("selfChipAvatar");
       const fb = document.getElementById("selfChipFallback");
       const nameEl = document.getElementById("selfChipName");
-      if (av) { av.src = data.face || ""; av.style.display = data.face ? "block" : "none"; }
+      if (av) { av.onerror = selfChipAvatarError; av.src = data.face || ""; av.style.display = data.face ? "block" : "none"; }
       if (fb) {
         fb.textContent = (data.name || "?").charAt(0);
         fb.style.display = data.face ? "none" : "flex";
@@ -2598,6 +2605,9 @@ function selfVideoCard(v, favName = "") {
   const direct = v.bvid
     ? `<a class="btn-direct" href="https://www.bilibili.com/video/${encodeURIComponent(v.bvid)}" target="_blank" rel="noopener">直达</a>`
     : "";
+  const favUp = v.owner_mid
+    ? `<button class="btn-favup" onclick="addUp('${String(v.owner_mid).replace(/'/g, "\\'")}', '${escapeAttr(v.owner_name || "")}', '')">收藏UP主</button>`
+    : "";
   const isDl = v.bvid && (v.downloaded || isDownloadedCheck("0", v.bvid));
   const dl = v.bvid
     ? `<button class="btn-download${isDl ? " downloaded" : ""}" ${isDl ? "disabled" : ""} onclick="downloadVideo('${v.bvid}', '${escapeAttr(v.title)}', '${escapeAttr(v.owner_name || "未知UP主")}', false, null, '', '${selfStab}', '${escapeAttr(favName)}')">${isDl ? "已下载" : "下载"}</button>`
@@ -2607,7 +2617,7 @@ function selfVideoCard(v, favName = "") {
     <div class="sc-body">
       <div class="sc-title">${escapeHtml(v.title)}</div>
       ${owner}
-      <div class="dy-actions">${direct}${dl}</div>
+      <div class="dy-actions">${favUp}${direct}${dl}</div>
     </div>
   </div>`;
 }
