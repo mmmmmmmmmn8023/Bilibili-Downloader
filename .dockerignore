@@ -1,10 +1,31 @@
-.venv/
-__pycache__/
-*.pyc
-.git/
-.workbuddy/
-logs/
-downloads/
+# 排除本地 Windows 二进制（Linux 容器用 apt 安装的 ffmpeg）
 ffmpeg/
+*.exe
+
+# 版本控制与本地环境
+.git/
+.gitignore
+.env
+.env.example
+
+# 运行期生成的数据，不应进入镜像
+downloads/
+logs/
 config.json
 download_history.json
+Caddyfile
+*.log
+
+# Windows 启动脚本
+*.bat
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# 文档与部署辅助（可选，减小上下文层）
+README.md
+DEPLOY.md
+LICENSE

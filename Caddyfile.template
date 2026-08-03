@@ -12,6 +12,27 @@ __DOMAIN__ {
         __AUTH_USER__ __HASH__
     }
 
+    # 限制请求体大小，防止大请求体 DoS 滥用（正常接口仅传 JSON，远小于此值）
+    request_body {
+        max_size 50MB
+    }
+
+    # 安全响应头：在反代层统一下发，降低凭证泄露 / 劫持 / 嗅探风险
+    header {
+        # 禁止浏览器 MIME 嗅探
+        X-Content-Type-Options "nosniff"
+        # 禁止被嵌进 iframe，防点击劫持
+        X-Frame-Options "DENY"
+        # 跳转/加载不携带 Referer，避免内部路径泄露
+        Referrer-Policy "no-referrer"
+        # 限制页面资源来源，降低 XSS 风险（仅允许同源脚本/样式）
+        Content-Security-Policy "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'"
+        # 强制 HTTPS（max-age 半年，含子域）
+        Strict-Transport-Security "max-age=15768000; includeSubDomains"
+        # 隐藏后端技术栈
+        -Server
+    }
+
     # 反代到内部 app 服务
     reverse_proxy app:8000
 }

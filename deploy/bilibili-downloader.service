@@ -1,0 +1,36 @@
+# Bilibili-Downloader 开机自启单元（systemd）
+#
+# 用法（在服务器上执行）：
+#   1) 把本文件放到 /etc/systemd/system/bilibili-downloader.service
+#   2) 按需修改下面 WorkingDirectory 为你的项目实际路径
+#   3) 重新加载并启用：
+#        sudo systemctl daemon-reload
+#        sudo systemctl enable bilibili-downloader
+#        sudo systemctl start  bilibili-downloader   # 立即启动（等价于 docker compose up -d）
+#
+# 说明：
+#   - 依赖 docker.service，确保 Docker 先启动
+#   - 本单元仅在开机/重启时把 compose 项目拉起；应用自身的 restart: unless-stopped 负责容器崩溃自愈
+#   - 日常代码更新仍走 GitHub Actions 自动部署（deploy-bilibili.sh），本单元不负责拉代码
+
+[Unit]
+Description=Bilibili-Downloader (docker compose)
+# 等 Docker 守护进程就绪后再启动本单元
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# 项目目录（须与 deploy-bilibili.sh 中的 DIR 一致）
+WorkingDirectory=/var/www/Bilibili-Downloader
+# 开机拉起 compose 项目
+ExecStart=/usr/bin/docker compose -f docker-compose.prod.yml up -d
+# 关机/停止时按顺序停止容器
+ExecStop=/usr/bin/docker compose -f docker-compose.prod.yml down
+# 失败最多重试 3 次，间隔 5 秒
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

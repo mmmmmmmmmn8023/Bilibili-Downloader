@@ -131,5 +131,88 @@ docker compose -f docker-compose.prod.yml exec caddy caddy list-certificates
 | `docker-compose.prod.yml` | 生产编排：app 内部 + caddy 反代 |
 | `Caddyfile.template` | Caddy 配置模板（含占位符，由 deploy.sh 渲染） |
 | `.env.example` | 配置模板（DOMAIN / AUTH_USER / AUTH_PASS / ADMIN_EMAIL） |
-| `deploy.sh` | 一键部署脚本 |
+| `deploy.sh` | 一键部署脚本（读 .env → 生成哈希 → 渲染 Caddyfile → 启动 + 健康检查） |
+| `deploy/deploy-bilibili.sh` | 服务器侧部署脚本模板（由 GitHub Actions 经 SSH 调用） |
 | `.gitignore` | 已排除真实 `.env` 与生成的 `Caddyfile` |
+
+---
+
+## 九、GitHub Actions 自动部署（push 即上线）
+
+仓库已内置 `.github/workflows/deploy.yml`：当你 **push 到 `develop/feature` 分支**（或在 Actions 页面手动 Run）时，GitHub 会自动 SSH 登录你的服务器并执行部署脚本，**无需手动登服务器 `git pull`**。
+
+### 1. 服务器准备
+
+```bash
+# 1) 安装并启用 Docker + compose 插件（略，参见第三节）
+
+# 2) 把 deploy/deploy-bilibili.sh 放到项目目录【之外】，例如 /var/www/
+cp deploy/deploy-bilibili.sh /var/www/deploy-bilibili.sh
+chmod +x /var/www/deploy-bilibili.sh
+
+# 3) 首次准备运行配置（deploy.sh 会读取 .env 并渲染 Caddyfile）
+cd /var/www/Bilibili-Downloader   # 首次 push 后由脚本自动克隆生成
+cp .env.example .env
+vim .env                            # 填 DOMAIN / AUTH_USER / AUTH_PASS / ADMIN_EMAIL
+```
+
+> 脚本逻辑：目录不存在则 `git clone`，已存在则 `git pull --ff-only`，随后调用 `./deploy.sh`（后者负责生成 Caddyfile 并启动）。**不要**改成直接 `docker compose up`，否则 Caddyfile 不会生成、Caddy 启动失败。
+
+### 2. 配置 GitHub Secrets
+
+在仓库 **Settings → Secrets and variables → Actions** 中添加：
+
+| Secret 名 | 值 | 说明 |
+| --- | --- | --- |
+| `SERVER_HOST` | 服务器公网 IP 或域名 | SSH 目标 |
+| `SERVER_USER` | SSH 登录用户名 | 如 `root` 或普通用户 |
+| `SSH_PRIVATE_KEY` | 私钥（对应服务器 `~/.ssh/authorized_keys` 里的公钥） | 用于免密登录 |
+
+若 SSH 端口不是 22，请在 `.github/workflows/deploy.yml` 的 `port` 字段修改。
+
+### 3. 验证
+
+```bash
+git push origin develop/feature
+# 到 GitHub → Actions 标签页查看 Deploy to Server 是否绿勾
+# 浏览器打开 https://你的域名 验证可访问
+```
+
+### 4. 注意事项
+
+- **凭证安全**：`.env`、`config.json`、`download_history.json` 均已被 `.gitignore` 排除，不会随代码提交；SSH 私钥只存在 GitHub Secrets，不进仓库。
+- **首次部署需手动准备 `.env`**：自动部署脚本依赖服务器上已存在的 `.env`，首次请按上面第 1 步手动创建。
+- **不要本地改动被跟踪文件**：`git pull --ff-only` 只接受快进；若服务器本地改了被跟踪文件，会导致 pull 失败，需先处理再触发部署。
+
+---
+
+## 十、开机自启（systemd）
+
+上面 `restart: unless-stopped` 只在 **Docker 守护进程已运行**时让容器自愈；若服务器断电重启、Docker 自身未设开机启动，则服务不会自动起来。用 systemd 单元兜住这一层：开机后自动 `docker compose up -d`。
+
+### 1. 安装单元
+
+仓库内置模板 `deploy/bilibili-downloader.service`，在服务器上：
+
+```bash
+sudo cp deploy/bilibili-downloader.service /etc/systemd/system/bilibili-downloader.service
+# 确认 WorkingDirectory 与 deploy-bilibili.sh 的 DIR 一致（默认 /var/www/Bilibili-Downloader）
+sudo systemctl daemon-reload
+sudo systemctl enable bilibili-downloader     # 设为开机自启
+sudo systemctl start  bilibili-downloader     # 立即启动（等同 docker compose up -d）
+```
+
+### 2. 常用命令
+
+```bash
+systemctl status bilibili-downloader          # 查看状态
+systemctl stop  bilibili-downloader           # 停止（会 docker compose down）
+systemctl disable bilibili-downloader         # 取消开机自启
+```
+
+### 3. 说明
+
+- 单元 `After/Requires=docker.service`，确保 Docker 先就绪。
+- 类型 `oneshot` + `RemainAfterExit`：拉起 compose 后即视为"运行中"，不常驻进程。
+- **本单元只负责开机拉起**，日常代码更新仍由 GitHub Actions 自动部署（`deploy-bilibili.sh`）完成，两者互补。
+- 若你的 Docker 本身已 `systemctl enable docker`（多数云镜像默认），且只靠 `restart: unless-stopped` 也能满足需求，本单元为可选增强。

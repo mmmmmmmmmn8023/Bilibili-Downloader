@@ -27,6 +27,22 @@ services:
       - ./config.json:/app/config.json
       - ./download_history.json:/app/download_history.json
       - ./logs:/app/logs
+    # 健康检查：TCP 探测 8000，确认服务已监听再放行流量
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket,sys; s=socket.socket(); sys.exit(0) if s.connect_ex(('127.0.0.1', 8000))==0 else sys.exit(1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    # 资源限制：避免批量下载吃光内存/CPU 把宿主机拖垮
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+          cpus: "1.5"
+        reservations:
+          memory: 256m
+          cpus: "0.25"
     restart: unless-stopped
     networks:
       - internal
@@ -41,8 +57,10 @@ services:
       - ./Caddyfile:/etc/caddy/Caddyfile
       - caddy_data:/data      # 证书存储（切勿删除，否则需重新申请）
       - caddy_config:/config
+    # 等 app 通过健康检查后再启动，避免 Caddy 代理到未就绪服务
     depends_on:
-      - app
+      app:
+        condition: service_healthy
     restart: unless-stopped
     networks:
       - internal
