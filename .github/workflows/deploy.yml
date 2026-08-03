@@ -44,10 +44,11 @@ jobs:
         run: |
           set -euo pipefail   # 任一命令失败即终止
 
-          # 校验必填 secret
+          # 校验必填 secret（SSH_HOST / SSH_USER）
           : "${SSH_HOST:?请到仓库 Settings → Secrets 配置 SSH_HOST}"
           : "${SSH_USER:?请配置 SSH_USER}"
-          : "${SSH_PRIVATE_KEY:?请配置 SSH_PRIVATE_KEY（ssh-agent 步骤已校验，此处为二次保险）}"
+          # 注：SSH_PRIVATE_KEY 已由上方 ssh-agent 步骤注入到 ssh-agent，
+          #     并非环境变量，故不在环境变量中读取，无需此处校验。
 
           echo "==> 通过 SSH 连接 ${SSH_USER}@${SSH_HOST}:${SSH_PORT} 执行部署脚本"
 
