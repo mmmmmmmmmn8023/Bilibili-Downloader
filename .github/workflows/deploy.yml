@@ -1,6 +1,7 @@
-# 部署到服务器（SSH 密钥方案，配合 GHCR 镜像）
-# 前置：build.yml 已把镜像推到 ghcr.io/<owner>/bilibili-downloader:latest
-# 链路：push develop/feature → build.yml 先把镜像推到 GHCR → 本 workflow SSH 登录服务器拉取并重启
+# 部署到服务器（SSH 密钥方案，服务器本地 Docker 构建）
+# 前置：build.yml 已通过代码质量门禁
+# 链路：push develop/feature → build.yml 代码质量检查 → 本 workflow SSH 登录服务器 → 拉代码 → 本地 docker compose build 并重启
+# 说明：本项目不使用 GHCR，app 镜像由服务器本地构建（见 deploy-bilibili.sh / deploy.sh）
 # 需配置 Secrets：SSH_HOST / SSH_USER（必填）；SSH_PRIVATE_KEY（私钥，必填）；
 #                SSH_PORT / DEPLOY_SCRIPT（选填）
 # 生成方式见下方说明；私钥仅存于 GitHub Secrets，不出现在仓库。
@@ -23,9 +24,8 @@ jobs:
     runs-on: ubuntu-latest
     # 说明：build.yml 与 deploy.yml 是两个独立 workflow，均监听 push develop/feature。
     # 二者并非用 needs 串联（needs 只能引用同文件内的 job），而是靠触发顺序配合：
-    #   build.yml 先把镜像推到 GHCR 成功后，deploy.yml 才 SSH 登录服务器拉取并重启。
-    #   若 build 失败，GHCR 上没有新镜像，deploy 脚本里的 docker pull 会告警但容器仍跑旧版，
-    #   不会把坏版本推上线。
+    #   build.yml 先做代码质量门禁，通过后 deploy.yml 才 SSH 登录服务器执行本地构建与重启。
+    #   若 build 失败（代码有语法/导入错误），deploy 不会被触发，避免把坏代码部署上线。
 
     steps:
       # 通过 ssh-agent 注入私钥，实现免密 SSH 登录（比密码更安全）

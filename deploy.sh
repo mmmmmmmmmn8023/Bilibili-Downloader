@@ -69,9 +69,9 @@ sed -e "s|__DOMAIN__|${DOMAIN}|g" \
     Caddyfile.template > Caddyfile
 echo "    Caddyfile 已生成（域名：${DOMAIN}）"
 
-echo "==> [7/7] 拉取镜像并启动服务"
-# 镜像由 GitHub Actions (build.yml) 云端构建并推送到 GHCR；此处仅拉取并启动，不在服务器构建
-docker compose -f docker-compose.prod.yml up -d --pull always
+echo "==> [7/7] 构建镜像并启动服务"
+# app 镜像由服务器本地 docker compose build 构建（不使用 GHCR）
+docker compose -f docker-compose.prod.yml up -d --build
 
 # ---- 部署后健康检查 ----
 echo ""

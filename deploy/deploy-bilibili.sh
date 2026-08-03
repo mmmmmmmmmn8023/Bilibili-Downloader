@@ -9,7 +9,7 @@
 #   push develop/feature → GitHub Actions 用 SSH 私钥登录服务器 → 执行本脚本
 # 登录方式：deploy.yml 通过 webfactory/ssh-agent 注入私钥（secrets.SSH_PRIVATE_KEY），
 #           服务器 ~/.ssh/authorized_keys 中需含有对应公钥，无需密码。
-# 镜像由 GitHub Actions (build.yml) 云端构建并推送到 GHCR，本脚本只负责拉取并重启。
+# 镜像由服务器本地 docker compose build 构建（不使用 GHCR），本脚本克隆代码后调用 deploy.sh 构建并重启。
 #
 set -euo pipefail
 
@@ -17,11 +17,6 @@ set -euo pipefail
 REPO="https://github.com/mmmmmmmmmn8023/Bilibili-Downloader.git"
 DIR="/var/www/Bilibili-Downloader"      # 克隆目标目录（和本脚本路径分开）
 BRANCH="develop/feature"
-GHCR_IMAGE="ghcr.io/mmmmmmmmmn8023/bilibili-downloader:latest"
-# 私有仓库需 GHCR 拉取凭证（公开仓库可留空）；在服务器执行 `docker login ghcr.io` 后写入
-# 也可把账号密码放到下方，或用 GitHub PAT（含 read:packages）做 docker login
-GHCR_USER="${GHCR_USER:-}"
-GHCR_PASS="${GHCR_PASS:-}"
 # ==================================
 
 echo "==> [$(date '+%F %T')] 开始部署 $REPO @ $BRANCH"
@@ -43,16 +38,9 @@ cd "$DIR"
 touch config.json download_history.json
 mkdir -p downloads logs
 
-# 登录 GHCR 并拉取最新 app 镜像（公开仓库可跳过登录；私有仓库必须）
-if [ -n "$GHCR_USER" ] && [ -n "$GHCR_PASS" ]; then
-  echo "==> 登录 GHCR 并拉取镜像"
-  echo "$GHCR_PASS" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
-fi
-docker pull "$GHCR_IMAGE" || echo "警告：拉取 $GHCR_IMAGE 失败（可能镜像尚未构建或仓库私有未登录）"
-
 # 关键：调用仓库自带的 deploy.sh
-#   deploy.sh 会：读 .env → 生成 Basic Auth 哈希 → 渲染 Caddyfile → up -d --pull always → 健康检查
-#   ⚠️ 不要改成直接 `docker compose up -d --build`，否则 Caddyfile 不会生成，Caddy 启动失败
+#   deploy.sh 会：读 .env → 生成 Basic Auth 哈希 → 渲染 Caddyfile → up -d --build（本地构建 app 镜像）→ 健康检查
+#   ⚠️ 不要改成直接 `docker compose up -d`（不带 --build），否则 Caddyfile 不会生成，Caddy 启动失败
 if [ -f "./deploy.sh" ]; then
   chmod +x deploy.sh
   ./deploy.sh

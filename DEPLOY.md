@@ -67,9 +67,9 @@ chmod +x deploy.sh
 #    输入 Basic Auth 账号密码 → 进入后在「设置」填入你的 B 站 SESSDATA
 ```
 
-`deploy.sh` 会自动完成：检查 Docker → 读取 `.env` → 用 caddy 镜像生成密码哈希 → 生成 `Caddyfile` → 拉取 GHCR 镜像并启动容器。
+`deploy.sh` 会自动完成：检查 Docker → 读取 `.env` → 用 caddy 镜像生成密码哈希 → 生成 `Caddyfile` → **本地 `docker compose build` 构建 app 镜像**并启动容器。
 
-> **镜像来源（推荐）**：`app` 镜像由 GitHub Actions 工作流 `.github/workflows/build.yml` 在**云端构建**并推送到 GitHub Container Registry（GHCR：`ghcr.io/mmmmmmmmmn8023/bilibili-downloader:latest`），服务器只负责 `docker pull` + 启动，**无需在服务器上构建**。本地手动 `./deploy.sh` 也能用，但需先 `docker pull` 该镜像（或把 compose 改回 `build: .`）。
+> **镜像来源**：本项目**不使用 GHCR**。`app` 镜像由服务器本地 `docker compose build` 基于仓库内 `Dockerfile` 构建（`docker-compose.prod.yml` 中 `build: .`），无需云端构建或拉取远程镜像。CI（`build.yml`）仅做代码质量门禁，不参与镜像构建。
 
 ---
 
@@ -82,13 +82,12 @@ docker compose -f docker-compose.prod.yml logs -f
 # 停止
 docker compose -f docker-compose.prod.yml down
 
-# 更新（拉取最新代码后重新部署；镜像已由 CI 推到 GHCR）
+# 更新（拉取最新代码后重新部署；镜像由服务器本地构建）
 git pull
 ./deploy.sh
 
-# 手动拉取最新镜像并重启（不依赖 CI）
-docker pull ghcr.io/mmmmmmmmmn8023/bilibili-downloader:latest
-docker compose -f docker-compose.prod.yml up -d
+# 手动重新构建并重启（不依赖 CI）
+docker compose -f docker-compose.prod.yml up -d --build
 
 # 修改 Basic Auth 密码
 vim .env              # 改 AUTH_PASS
@@ -134,13 +133,13 @@ docker compose -f docker-compose.prod.yml exec caddy caddy list-certificates
 
 | 文件 | 作用 |
 | --- | --- |
-| `docker-compose.prod.yml` | 生产编排：app（GHCR 镜像）内部 + caddy 反代 |
+| `docker-compose.prod.yml` | 生产编排：app（服务器本地 `build: .` 构建）内部 + caddy 反代 |
 | `Caddyfile.template` | Caddy 配置模板（含占位符，由 deploy.sh 渲染） |
 | `.env.example` | 配置模板（DOMAIN / AUTH_USER / AUTH_PASS / ADMIN_EMAIL） |
-| `deploy.sh` | 一键部署脚本（读 .env → 生成哈希 → 渲染 Caddyfile → 拉镜像并启动 + 健康检查） |
-| `.github/workflows/build.yml` | CI：推送时云端做代码质量检查（语法/导入）+ 构建镜像并推送到 GHCR |
-| `.github/workflows/deploy.yml` | CI：`needs: build`，仅当 build 通过才 SSH 到服务器执行部署 |
-| `deploy/deploy-bilibili.sh` | 服务器侧部署脚本（SSH 调用：`git pull` + 登录 GHCR + 拉镜像 + `./deploy.sh`） |
+| `deploy.sh` | 一键部署脚本（读 .env → 生成哈希 → 渲染 Caddyfile → 本地 build 镜像并启动 + 健康检查） |
+| `.github/workflows/build.yml` | CI：推送时做代码质量门禁（语法/导入检查），不参与镜像构建 |
+| `.github/workflows/deploy.yml` | CI：通过 SSH 私钥登录服务器，调用 `deploy-bilibili.sh` 执行部署 |
+| `deploy/deploy-bilibili.sh` | 服务器侧部署脚本（SSH 调用：`git pull` + `./deploy.sh` 本地构建并重启） |
 | `.gitignore` | 已排除真实 `.env` 与生成的 `Caddyfile` |
 
 > **GitHub Actions 部署所需的仓库 Secrets**（`Settings → Secrets and variables → Actions`）：

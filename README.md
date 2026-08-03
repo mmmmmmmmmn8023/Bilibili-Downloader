@@ -141,7 +141,7 @@ Dockerfile            多阶段构建（运行时用 apt 安装 ffmpeg）
 Caddyfile.template    Caddy 配置模板（反向代理 + Basic Auth + 安全头）
 deploy.sh             一键部署脚本（读 .env → 生成哈希 → 渲染 Caddyfile → 启动）
 deploy/               服务器侧部署脚本与 systemd 开机自启单元模板
-.github/workflows/    GitHub Actions：build.yml（云端构建测试+推 GHCR）/ deploy.yml（SSH 部署）
+.github/workflows/    GitHub Actions：build.yml（代码质量门禁）/ deploy.yml（SSH 私钥登录服务器本地构建部署）
 requirements.txt      依赖（curl_cffi / qrcode / Pillow）
 config.json           运行配置（自动生成，勿提交）
 download_history.json 下载历史（自动生成，勿提交）
