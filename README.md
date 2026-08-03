@@ -73,7 +73,7 @@ cp .env.example .env          # 填写 DOMAIN / AUTH_USER / AUTH_PASS / ADMIN_EM
 # 3. 浏览器访问 https://你的域名，输入 Basic Auth 账号密码
 ```
 
-推送代码到 `develop/feature` 分支会经 GitHub Actions 自动部署（详见 DEPLOY.md 第九节）。
+推送代码后，服务器由 cron 定时拉取 `develop/feature` 分支并自动重新部署（详见 DEPLOY.md 第九节）。
 
 ---
 
@@ -141,7 +141,7 @@ Dockerfile            多阶段构建（运行时用 apt 安装 ffmpeg）
 Caddyfile.template    Caddy 配置模板（反向代理 + Basic Auth + 安全头）
 deploy.sh             一键部署脚本（读 .env → 生成哈希 → 渲染 Caddyfile → 启动）
 deploy/               服务器侧部署脚本与 systemd 开机自启单元模板
-.github/workflows/    GitHub Actions 自动部署工作流
+.github/workflows/    GitHub Actions：build.yml（云端构建测试+推 GHCR）/ deploy.yml（SSH 部署）
 requirements.txt      依赖（curl_cffi / qrcode / Pillow）
 config.json           运行配置（自动生成，勿提交）
 download_history.json 下载历史（自动生成，勿提交）

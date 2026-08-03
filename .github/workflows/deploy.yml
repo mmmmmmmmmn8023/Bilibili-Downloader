@@ -1,0 +1,60 @@
+# 部署到服务器（SSH 密钥方案，配合 GHCR 镜像）
+# 前置：build.yml 已把镜像推到 ghcr.io/<owner>/bilibili-downloader:latest
+# 链路：push develop/feature → 云端 runner 用私钥 SSH 登录服务器 → 拉取新镜像并重启 app
+# 需配置 Secrets：SSH_HOST / SSH_USER（必填）；SSH_PRIVATE_KEY（私钥，必填）；
+#                SSH_PORT / DEPLOY_SCRIPT（选填）
+# 生成方式见下方说明；私钥仅存于 GitHub Secrets，不出现在仓库。
+
+name: 部署到服务器
+
+on:
+  push:
+    branches:
+      - develop/feature
+  workflow_dispatch:   # 允许在 Actions 页面手动触发
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false   # 排队执行，避免部署中途被打断
+
+jobs:
+  deploy:
+    name: SSH 执行部署脚本
+    runs-on: ubuntu-latest
+    # 只有 build.yml 的代码质量检查 + 镜像构建全部通过，才执行部署
+    needs: build
+    # build 被跳过/取消时也不部署
+    if: ${{ needs.build.result == 'success' }}
+
+    steps:
+      # 通过 ssh-agent 注入私钥，实现免密 SSH 登录（比密码更安全）
+      - name: 配置 SSH 私钥
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      # 通过 secrets 注入连接信息，SSH 远程拉取镜像并重启容器（核心步骤）
+      - name: 通过 SSH 执行部署
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT || '22' }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+          DEPLOY_SCRIPT: ${{ secrets.DEPLOY_SCRIPT || '/var/www/deploy-bilibili.sh' }}
+        run: |
+          set -euo pipefail   # 任一命令失败即终止
+
+          # 校验必填 secret
+          : "${SSH_HOST:?请到仓库 Settings → Secrets 配置 SSH_HOST}"
+          : "${SSH_USER:?请配置 SSH_USER}"
+          : "${SSH_PRIVATE_KEY:?请配置 SSH_PRIVATE_KEY（ssh-agent 步骤已校验，此处为二次保险）}"
+
+          echo "==> 通过 SSH 连接 ${SSH_USER}@${SSH_HOST}:${SSH_PORT} 执行部署脚本"
+
+          # 跳过主机指纹确认（CI 无交互必需）；仅限可信网络使用
+          ssh -o StrictHostKeyChecking=no \
+              -o UserKnownHostsFile=/dev/null \
+              -p "${SSH_PORT}" \
+              "${SSH_USER}@${SSH_HOST}" \
+              "bash ${DEPLOY_SCRIPT}"
+
+          echo "==> 部署命令已执行完毕"

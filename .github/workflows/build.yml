@@ -1,0 +1,56 @@
+# 云端构建、测试并推送镜像到 GitHub Container Registry (GHCR)
+# 流程：push develop/feature → 代码质量校验 → docker build → 推送到 ghcr.io/<owner>/bilibili-downloader
+# 仅当本工作流成功，deploy.yml（needs: build）才会 SSH 到服务器部署
+#
+# 说明：本项目暂无单元测试，这里用"代码质量门禁"替代——
+#   - py_compile 语法检查：拦截语法错误
+#   - 导入检查：确认依赖可正常 import（Docker 镜像内已装好依赖）
+#   后续可补 pytest 用例，本文件加一步 pytest 即可。
+
+name: 构建并测试
+
+on:
+  push:
+    branches:
+      - develop/feature
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write   # 推送到 GHCR 必需
+
+jobs:
+  build:
+    name: 构建镜像并推送到 GHCR
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v6
+
+      # 代码质量门禁：语法 + 导入检查（用官方 Python 镜像，环境与运行一致）
+      - name: 代码质量检查
+        uses: docker://python:3.13-slim
+        with:
+          entrypoint: /bin/bash
+          args: -c "pip install --no-cache-dir curl_cffi qrcode Pillow && python -m py_compile server.py bilibili.py && python -c 'import server, bilibili; print(\"导入检查通过\")'"
+
+      # 登录 GHCR（使用内置 GITHUB_TOKEN，无需额外配置）
+      - name: 登录 GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # 复用 Docker 层缓存，加速构建；构建成功才推送
+      - name: 构建并推送镜像
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ghcr.io/${{ github.repository_owner }}/bilibili-downloader:latest

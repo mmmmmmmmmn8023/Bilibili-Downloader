@@ -6,14 +6,16 @@
 #   2. chmod +x deploy.sh && ./deploy.sh
 #
 # 说明：
+#   - app 镜像由 GitHub Actions (build.yml) 云端构建并推送到 GHCR，
+#     本机只需 docker pull 拉取，无需在服务器上 build（见 deploy-bilibili.sh）
 #   - app 仅 expose 8000（内部网络），不映射公网端口
 #   - 公网只经 Caddy 的 80(证书验证) / 443(HTTPS) 暴露
 #   - Web 界面无内置登录，全靠 Caddy 的 Basic Auth 作公网唯一防线
 
 services:
   app:
-    build: .
-    image: bilibili-downloader:latest
+    # 使用 GHCR 上由 build.yml 推送的预构建镜像（仓库名自动转小写）
+    image: ghcr.io/mmmmmmmmmn8023/bilibili-downloader:latest
     container_name: bilibili-downloader
     environment:
       - PORT=8000
