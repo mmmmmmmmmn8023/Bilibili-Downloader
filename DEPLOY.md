@@ -132,57 +132,63 @@ docker compose -f docker-compose.prod.yml exec caddy caddy list-certificates
 | `Caddyfile.template` | Caddy 配置模板（含占位符，由 deploy.sh 渲染） |
 | `.env.example` | 配置模板（DOMAIN / AUTH_USER / AUTH_PASS / ADMIN_EMAIL） |
 | `deploy.sh` | 一键部署脚本（读 .env → 生成哈希 → 渲染 Caddyfile → 启动 + 健康检查） |
-| `deploy/deploy-bilibili.sh` | 服务器侧部署脚本模板（由 GitHub Actions 经 SSH 调用） |
+| `deploy/deploy-bilibili.sh` | 服务器侧部署脚本模板（cron 定时调用：`git pull` + `./deploy.sh`） |
 | `.gitignore` | 已排除真实 `.env` 与生成的 `Caddyfile` |
 
 ---
 
-## 九、GitHub Actions 自动部署（push 即上线）
+## 九、服务器自动拉取更新（cron 定时部署）
 
-仓库已内置 `.github/workflows/deploy.yml`：当你 **push 到 `develop/feature` 分支**（或在 Actions 页面手动 Run）时，GitHub 会自动 SSH 登录你的服务器并执行部署脚本，**无需手动登服务器 `git pull`**。
+仓库为**公共仓库**，服务器无需任何密钥即可 `git pull`。用 cron 让服务器**自己定时拉取最新代码并重新部署**，不依赖 GitHub Actions / SSH 反向连接。
 
-### 1. 服务器准备
+### 1. 服务器首次准备
 
 ```bash
-# 1) 安装并启用 Docker + compose 插件（略，参见第三节）
+# 1) 克隆仓库（公共仓库，无需认证）
+git clone https://github.com/mmmmmmmmmn8023/Bilibili-Downloader.git /var/www/Bilibili-Downloader
+cd /var/www/Bilibili-Downloader
+git checkout develop/feature
 
-# 2) 把 deploy/deploy-bilibili.sh 放到项目目录【之外】，例如 /var/www/
-cp deploy/deploy-bilibili.sh /var/www/deploy-bilibili.sh
-chmod +x /var/www/deploy-bilibili.sh
-
-# 3) 首次准备运行配置（deploy.sh 会读取 .env 并渲染 Caddyfile）
-cd /var/www/Bilibili-Downloader   # 首次 push 后由脚本自动克隆生成
+# 2) 准备运行配置（deploy.sh 会读取 .env 并渲染 Caddyfile）
 cp .env.example .env
 vim .env                            # 填 DOMAIN / AUTH_USER / AUTH_PASS / ADMIN_EMAIL
+
+# 3) 首次部署
+chmod +x deploy.sh deploy/deploy-bilibili.sh
+./deploy.sh
+
+# 4) 把部署脚本放到项目目录之外（避免 git pull 时冲突），并指向项目目录
+cp deploy/deploy-bilibili.sh /var/www/deploy-bilibili.sh
+chmod +x /var/www/deploy-bilibili.sh
 ```
 
-> 脚本逻辑：目录不存在则 `git clone`，已存在则 `git pull --ff-only`，随后调用 `./deploy.sh`（后者负责生成 Caddyfile 并启动）。**不要**改成直接 `docker compose up`，否则 Caddyfile 不会生成、Caddy 启动失败。
+### 2. 配置 cron 定时任务
 
-### 2. 配置 GitHub Secrets
+```bash
+crontab -e
+```
 
-在仓库 **Settings → Secrets and variables → Actions** 中添加：
+加入（每 5 分钟拉取一次并重新部署）：
 
-| Secret 名 | 值 | 说明 |
-| --- | --- | --- |
-| `SERVER_HOST` | 服务器公网 IP 或域名 | SSH 目标 |
-| `SERVER_USER` | SSH 登录用户名 | 如 `root` 或普通用户 |
-| `SSH_PRIVATE_KEY` | 私钥（对应服务器 `~/.ssh/authorized_keys` 里的公钥） | 用于免密登录 |
+```cron
+*/5 * * * * cd /var/www/Bilibili-Downloader && git pull --ff-only origin develop/feature && /var/www/deploy-bilibili.sh >> /var/log/bili-deploy.log 2>&1
+```
 
-若 SSH 端口不是 22，请在 `.github/workflows/deploy.yml` 的 `port` 字段修改。
+> 说明：`git pull --ff-only` 只接受快进合并；拉到新代码后调用 `deploy-bilibili.sh`（内部执行 `./deploy.sh` 重新生成 Caddyfile 并 `docker compose up -d --build`）。如只想拉代码不重建容器，去掉 `&& /var/www/deploy-bilibili.sh` 即可。
 
 ### 3. 验证
 
 ```bash
-git push origin develop/feature
-# 到 GitHub → Actions 标签页查看 Deploy to Server 是否绿勾
-# 浏览器打开 https://你的域名 验证可访问
+crontab -l                                  # 确认任务已注册
+tail -f /var/log/bili-deploy.log            # 观察下次触发输出
+git push origin develop/feature             # 本地推送后，最多 5 分钟服务器自动更新
 ```
 
 ### 4. 注意事项
 
-- **凭证安全**：`.env`、`config.json`、`download_history.json` 均已被 `.gitignore` 排除，不会随代码提交；SSH 私钥只存在 GitHub Secrets，不进仓库。
-- **首次部署需手动准备 `.env`**：自动部署脚本依赖服务器上已存在的 `.env`，首次请按上面第 1 步手动创建。
-- **不要本地改动被跟踪文件**：`git pull --ff-only` 只接受快进；若服务器本地改了被跟踪文件，会导致 pull 失败，需先处理再触发部署。
+- **凭证安全**：`.env`、`config.json`、`download_history.json` 均已被 `.gitignore` 排除，不会随代码提交。
+- **不要本地改动被跟踪文件**：`git pull --ff-only` 只接受快进；若服务器本地改了被跟踪文件，会导致 pull 失败，需先 `git checkout .` 或 `git stash` 处理。
+- **频率权衡**：5 分钟一次足够及时；如资源敏感可改为每小时 `0 * * * *`。
 
 ---
 
@@ -214,5 +220,5 @@ systemctl disable bilibili-downloader         # 取消开机自启
 
 - 单元 `After/Requires=docker.service`，确保 Docker 先就绪。
 - 类型 `oneshot` + `RemainAfterExit`：拉起 compose 后即视为"运行中"，不常驻进程。
-- **本单元只负责开机拉起**，日常代码更新仍由 GitHub Actions 自动部署（`deploy-bilibili.sh`）完成，两者互补。
+- **本单元只负责开机拉起容器**；日常代码更新由第九节的 cron 定时 `git pull` + `deploy-bilibili.sh` 完成，两者互补。
 - 若你的 Docker 本身已 `systemctl enable docker`（多数云镜像默认），且只靠 `restart: unless-stopped` 也能满足需求，本单元为可选增强。
