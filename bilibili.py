@@ -13,6 +13,7 @@ import re
 import time
 import uuid
 import hashlib
+import logging
 import threading
 import subprocess
 import urllib.parse
@@ -29,8 +30,15 @@ from curl_cffi import requests, CurlOpt
 # 在不受信任的网络上建议置为 True（通过 server 配置 insecure_tls=false 控制）。
 VERIFY_SSL = False
 
+# 模块级 logger（与 server.py 的 "bili-dl" 同名，日志统一进 logs/server.log）
+_logger = logging.getLogger("bili-dl")
+
 # 所有下载任务的状态存在这里，前端可以轮询查询进度
 download_tasks = {}
+# 保护 download_tasks 的读写锁：下载线程池/Web 线程/自动下载线程/重试定时器
+# 都会访问该字典，复合操作（遍历+pop、判阈值+清理、快照）必须持锁，避免
+# "dictionary changed size during iteration" 与并发写覆盖。
+tasks_lock = threading.Lock()
 
 # WBI 签名密钥（缓存，1小时刷新一次）
 _wbi_keys = None
@@ -204,10 +212,25 @@ def _classify_error(e):
         return "FFMPEG", "音视频合并失败（FFmpeg 报错）"
     if "命名模板渲染失败" in msg:
         return "TEMPLATE", "命名模板渲染失败（模板语法错误）"
-    if "超过设置上限" in msg:
+    if "超过设置上限" in msg or "所有分P均超过" in msg:
         return "SKIP_DUR", "已跳过：超过时长上限设置"
     if "大会员" in msg or "付费" in msg:
         return "PAY", "视频需大会员 / 付费专享"
+    # 6) 业务流程类文案（download_video / download_dynamic 抛出的已知业务异常）
+    if "缺少BV号" in msg:
+        return "NOBVID", "视频动态缺少BV号（动态数据异常，无法下载）"
+    if "没有可用的视频流" in msg:
+        return "NOSTREAM", "没有可用的视频流（可能需要登录或视频受限）"
+    if "没有可下载的分P" in msg:
+        return "NOPAGE", "没有可下载的分P"
+    if "未找到第" in msg and "集" in msg:
+        return "NOPAGE", "指定的分P不存在（页码超出范围）"
+    if "未找到前" in msg and "集内容" in msg:
+        return "NOPAGE", "max_pages 上限内无可下载内容"
+    if "暂不支持下载此类型动态" in msg:
+        return "BADTYPE", "暂不支持下载此类型动态"
+    if "无法获取下载地址" in msg:
+        return "NOURl", "无法获取下载地址（可能需要登录B站）"
     return "UNKNOWN", "未知下载错误"
 
 
@@ -281,31 +304,34 @@ def _qn_label_from_play(play_data):
 
 def update_task(task_id, status, progress, message, quality=None,
                 title=None, upname=None, task_type=None, params=None,
-                error_code=None, error_detail=None):
+                error_code=None, error_detail=None, file_path=None):
     """更新下载任务状态，前端通过轮询 /api/status 来获取这些信息。
-    所有扩展字段（quality/title/upname/task_type/params/error_code/error_detail）为
+    所有扩展字段（quality/title/upname/task_type/params/error_code/error_detail/file_path）为
     None 时保留原有值（保留式更新），让下载全过程不丢失元信息。"""
     if task_id:
-        t = download_tasks.get(task_id, {})
-        t["status"] = status
-        t["progress"] = progress
-        t["message"] = message
-        t["time"] = time.time()
-        if quality is not None:
-            t["quality"] = quality
-        if error_code is not None:
-            t["error_code"] = error_code
-        if error_detail is not None:
-            t["error_detail"] = error_detail
-        if title is not None:
-            t["title"] = title
-        if upname is not None:
-            t["upname"] = upname
-        if task_type is not None:
-            t["type"] = task_type
-        if params is not None:
-            t["params"] = params
-        download_tasks[task_id] = t
+        with tasks_lock:
+            t = download_tasks.get(task_id, {})
+            t["status"] = status
+            t["progress"] = progress
+            t["message"] = message
+            t["time"] = time.time()
+            if quality is not None:
+                t["quality"] = quality
+            if error_code is not None:
+                t["error_code"] = error_code
+            if error_detail is not None:
+                t["error_detail"] = error_detail
+            if title is not None:
+                t["title"] = title
+            if upname is not None:
+                t["upname"] = upname
+            if task_type is not None:
+                t["type"] = task_type
+            if params is not None:
+                t["params"] = params
+            if file_path is not None:
+                t["file_path"] = file_path
+            download_tasks[task_id] = t
 
 
 # ========================================================
@@ -333,6 +359,11 @@ def is_cancelled(task_id):
 def clear_cancel(task_id):
     if task_id:
         _cancel_tasks.discard(task_id)
+
+
+def clear_all_cancels():
+    """清空全部取消标记（与 download_tasks.clear() 同步清理）"""
+    _cancel_tasks.clear()
 
 
 def render_template(template, variables):
@@ -447,14 +478,15 @@ class BilibiliAPI:
                     self.session.cookies.set("DedeUserID", mid, domain=".bilibili.com")
                     self.session.cookies.set("DedeUserID__ckMd5", d.get("mid_md5", ""), domain=".bilibili.com")
                     self.session.cookies.set("sid", mid, domain=".bilibili.com")
-                # 刷新WBI密钥缓存
+                # 刷新WBI密钥缓存（持锁，与 _get_wbi_keys 互斥）
                 global _wbi_keys, _wbi_keys_time
                 if d.get("wbi_img"):
                     wbi = d["wbi_img"]
                     img_key = wbi["img_url"].rsplit("/", 1)[1].split(".")[0]
                     sub_key = wbi["sub_url"].rsplit("/", 1)[1].split(".")[0]
-                    _wbi_keys = (img_key, sub_key)
-                    _wbi_keys_time = time.time()
+                    with _wbi_lock:
+                        _wbi_keys = (img_key, sub_key)
+                        _wbi_keys_time = time.time()
         except Exception:
             pass  # 失败不阻塞
 
@@ -592,6 +624,7 @@ class BilibiliAPI:
                     "sign": d.get("sign", "这个人很懒什么都没写"),
                     "level": d.get("level", 0),
                     "archive_count": d.get("archive_count", 0),
+                    "album_count": 0,
                 }
         except Exception:
             pass  # 失败就试下一个方案
@@ -613,6 +646,7 @@ class BilibiliAPI:
                         "sign": d.get("sign", "这个人很懒什么都没写"),
                         "level": d.get("level", 0),
                         "archive_count": d.get("archive_count", 0),
+                        "album_count": 0,
                     }
             except Exception:
                 pass
@@ -629,6 +663,7 @@ class BilibiliAPI:
                         "sign": "",
                         "level": 0,
                         "archive_count": 0,
+                        "album_count": 0,
                     }
             except Exception:
                 pass
@@ -642,9 +677,11 @@ class BilibiliAPI:
                 "sign": "",
                 "level": 0,
                 "archive_count": 0,
+                "album_count": 0,
             }
 
-        # 投稿数量：用 navnum 的 data.video 校正（最权威，且不受 acc/info 的 -403 影响）
+        # 投稿数量：用 navnum 校正（最权威，且不受 acc/info 的 -403 影响）
+        # data.video=视频投稿数，data.album=图文/图集投稿数
         # 取 max(acc_info 的 archive_count, navnum 的 video)，保证任意单源受限都有兜底
         try:
             nav = self._api_get(
@@ -653,9 +690,13 @@ class BilibiliAPI:
                 extra_headers={"Referer": f"https://space.bilibili.com/{uid}"},
             )
             if nav.get("code") == 0:
-                nav_video = nav.get("data", {}).get("video", 0) or 0
+                nav_data = nav.get("data", {}) or {}
+                nav_video = nav_data.get("video", 0) or 0
                 if nav_video and nav_video > user.get("archive_count", 0):
                     user["archive_count"] = nav_video
+                nav_album = nav_data.get("album", 0) or 0
+                if nav_album and nav_album > user.get("album_count", 0):
+                    user["album_count"] = nav_album
         except Exception:
             pass
 
@@ -730,46 +771,71 @@ class BilibiliAPI:
         接口受限时直接返回空列表并标记 limited=True，由前端提示用户
         去【动态】标签下载（视频动态同样可下载），保持"视频是视频、
         动态是动态"互不干扰。
+
+        错误分类（避免旧版 except: pass 把瞬时网络抖动永久当成受限）：
+        - 风控码(-403/-352/-412 等) / 非0业务码 → 直接 limited（不可重试）；
+        - 连接/超时类异常 → 有 SESSDATA 时轻量重试最多3次，仍失败再 limited；
+        - 游客(无 SESSDATA) → 不重试，直接 limited。
         """
-        # 方案1: 直接调用视频列表API（支持服务端分页）
-        try:
-            # 参考 BilibiliDown(INEedBiliAV) 的已知可用请求格式补充参数:
-            # tid(分区,0=全部) / keyword(搜索词,空) / platform=web
-            # 这几个参数对齐后, 签名与B站服务端预期一致, 可提高请求通过率
-            params = self._sign_wbi({
-                "mid": uid,
-                "tid": 0,
-                "pn": page,
-                "ps": page_size,
-                "keyword": "",
-                "order": "pubdate",
-                "platform": "web",
-            })
-            resp_data = self._api_get(
-                "https://api.bilibili.com/x/space/wbi/arc/search",
-                params=params,
-                extra_headers={"Referer": f"https://space.bilibili.com/{uid}/video"},
-            )
-            if resp_data["code"] == 0:
-                vlist = resp_data["data"]["list"]["vlist"]
-                videos = []
-                for v in vlist:
-                    videos.append({
-                        "bvid": v["bvid"],
-                        "title": v["title"],
-                        "cover": v["pic"],
-                        "duration": v.get("length", "??:??"),
-                        "play": v.get("play", 0),
-                        "created": v.get("created", 0),
-                        "description": v.get("description", ""),
-                        "charge_only": self._is_charge_only(v),
-                    })
-                total = resp_data["data"]["page"]["count"]
-                return {"videos": videos, "total": total, "page": page, "source": "api", "limited": False}
-        except Exception:
-            pass
-        # 接口受限：不借用动态凑数，保持"视频是视频、动态是动态"
-        return {"videos": [], "total": 0, "page": page, "source": "limited", "limited": True}
+        # 游客直接返回 limited，避免无谓重试空等
+        if not self.sessdata:
+            return {"videos": [], "total": 0, "page": page, "source": "limited", "limited": True}
+
+        # 参考 BilibiliDown(INEedBiliAV) 的已知可用请求格式补充参数:
+        # tid(分区,0=全部) / keyword(搜索词,空) / platform=web
+        # 这几个参数对齐后, 签名与B站服务端预期一致, 可提高请求通过率
+        params = self._sign_wbi({
+            "mid": uid,
+            "tid": 0,
+            "pn": page,
+            "ps": page_size,
+            "keyword": "",
+            "order": "pubdate",
+            "platform": "web",
+        })
+        url = "https://api.bilibili.com/x/space/wbi/arc/search"
+        referer = f"https://space.bilibili.com/{uid}/video"
+
+        # 风控/业务错误码：返回 limited（不可重试）
+        LIMITED_CODES = frozenset({-403, -352, -412, -509, -799, -101})
+        last_reason = ""
+        for attempt in range(3):
+            try:
+                resp_data = self._api_get(url, params=params, extra_headers={"Referer": referer})
+                code = resp_data.get("code", -1)
+                if code == 0:
+                    vlist = resp_data["data"]["list"]["vlist"]
+                    videos = []
+                    for v in vlist:
+                        videos.append({
+                            "bvid": v["bvid"],
+                            "title": v["title"],
+                            "cover": v["pic"],
+                            "duration": v.get("length", "??:??"),
+                            "play": v.get("play", 0),
+                            "created": v.get("created", 0),
+                            "description": v.get("description", ""),
+                            "charge_only": self._is_charge_only(v),
+                        })
+                    total = resp_data["data"]["page"]["count"]
+                    return {"videos": videos, "total": total, "page": page, "source": "api", "limited": False}
+                # 非0业务码：风控类直接放弃；其它也视为受限（不重试，重试也不会变）
+                last_reason = f"BILI {code}: {resp_data.get('message', '')}"
+                _logger.warning("get_user_videos uid=%s page=%s 接口返回非0: %s", uid, page, last_reason)
+                return {"videos": [], "total": 0, "page": page, "source": "limited", "limited": True,
+                        "reason": last_reason}
+            except Exception as e:
+                last_reason = str(e)
+                # 连接/超时类错误才重试；其余（签名失败等）不重试
+                if _is_conn_error(e) and attempt < 2:
+                    _logger.info("get_user_videos uid=%s page=%s 第%d次失败(可重试): %s", uid, page, attempt + 1, last_reason)
+                    time.sleep(3)
+                    continue
+                _logger.warning("get_user_videos uid=%s page=%s 失败: %s", uid, page, last_reason)
+                break
+        # 重试耗尽或不可重试异常 → limited（带原因，便于前端/日志区分）
+        return {"videos": [], "total": 0, "page": page, "source": "limited", "limited": True,
+                "reason": last_reason}
 
 
     def fetch_dynamics_batch(self, uid, offset=""):
@@ -788,18 +854,49 @@ class BilibiliAPI:
         items = data.get("data", {}).get("items", [])
         next_offset = data.get("data", {}).get("offset", "")
         has_more = data.get("data", {}).get("has_more", False)
+
+        # 预先收集转发 orig 中的 bvid —— 用于去重：
+        # B站 feed API 在 UP 转发视频时，除了转发卡片，还会返回一条不带 orig 的
+        # DYNAMIC_TYPE_AV 独立卡片（同一 BV 号）。若不跳过，同视频会出现两张卡片
+        # （一张来自 orig 合成、一张来自 feed），且 feed 那张无法识别为转发。
+        synth_bvids = set()
+        for item in items:
+            orig = item.get("orig")
+            if orig and isinstance(orig, dict):
+                try:
+                    # 提取 orig 的 bvid（两种路径都兼容）
+                    om = (orig.get("modules") or {}).get("module_dynamic") or {}
+                    oarch = (om.get("major") or {}).get("archive") or {}
+                    obvid = oarch.get("bvid")
+                    if not obvid:
+                        # 兜底：递归搜整棵 orig 树
+                        obvid = (self._find_archive_in_tree(orig) or {}).get("bvid")
+                    if obvid:
+                        synth_bvids.add(obvid)
+                except Exception:
+                    pass
+
         parsed = []
         for item in items:
-            p = self._parse_dynamic(item)
+            p = self._parse_dynamic(item, host_mid=str(uid))
             if not p:
                 continue
+
+            # 跳过 feed 中已由 orig 合成覆盖的 DYNAMIC_TYPE_AV（防重复）
+            if synth_bvids and p.get("type") == "video" and not (item.get("orig") and isinstance(item.get("orig"), dict)):
+                if p.get("bvid") and p["bvid"] in synth_bvids:
+                    continue
+
             parsed.append(p)
             # 转发动态的 orig 里包含原视频（投稿视频/动态视频），但 feed API 不一定单独返回它，
             # 额外解析出一条独立条目，让前端同时显示转发卡片和原视频卡片。
             # 仅对视频 origin 做此处理：图文/文字的 orig 已经作为独立动态存在 feed 里，不需要合成。
-            if item.get("type") == "DYNAMIC_TYPE_FORWARD" and item.get("orig"):
+            # 条件放宽为"凡带 orig 子动态"：兼容 B站 偶发把转发视频的 type 标成 DYNAMIC_TYPE_AV。
+            if item.get("orig") and isinstance(item.get("orig"), dict):
                 try:
-                    orig_parsed = self._parse_dynamic(item["orig"])
+                    # 传 host_mid：orig 可能是 DYNAMIC_TYPE_AV 视频卡，作者若非宿主（被转发），
+                    # 必须标"转发"而非"投稿视频"（与 feed 独立卡走同一判定，避免合成卡漏判）。
+                    orig_parsed = self._parse_dynamic(item["orig"], host_mid=str(uid))
                     if orig_parsed and orig_parsed.get("id") and orig_parsed.get("bvid") \
                        and orig_parsed["id"] != p.get("id"):
                         parsed.append(orig_parsed)
@@ -915,17 +1012,19 @@ class BilibiliAPI:
                     return r
         return None
 
-    def _parse_dynamic(self, item):
-        """解析单条动态，提取类型、文字、图片、BV号等"""
+    def _parse_dynamic(self, item, host_mid=None):
+        """解析单条动态，提取类型、文字、图片、BV号等。
+
+        host_mid: 可选，宿主UP的UID。非空时触发转发检测：若 DYNAMIC_TYPE_AV 的
+                  module_author.mid ≠ host_mid，说明该视频由其他UP投稿、被宿主转发，
+                  应标记为"转发"而非"投稿视频"。
+        """
         try:
             dtype = item.get("type") or ""
             did = item.get("id_str") or ""
             modules = item.get("modules") or {}
-            # 转发动态（DYNAMIC_TYPE_FORWARD）：原文内容在 orig 里，但必须在下方 FORWARD 分支
-            # 显式解析（保留"转发"外壳、正确提取 orig 的视频 bvid/封面/标题），不能在此提前递归，
-            # 否则转发外壳被吞掉、转发的视频会被误判为原作者的"投稿视频"。
-            if (not modules.get("module_dynamic", {}).get("major")) and item.get("orig") and dtype != "DYNAMIC_TYPE_FORWARD":
-                return self._parse_dynamic(item["orig"])
+            # 转发判定已移到下方 if/elif 链首位（is_forward）：凡带 orig 子动态一律按转发解析，
+            # 兼容 B站 偶发把"转发视频"的 type 标成 DYNAMIC_TYPE_AV 的异常（仍带 orig）。
             mod_author = modules.get("module_author") or {}
             mod_dynamic = modules.get("module_dynamic") or {}
 
@@ -954,10 +1053,23 @@ class BilibiliAPI:
                 "emoji_map": self._extract_emoji_map(desc),
             }
 
+            # ---- 转发动态（优先判定：B站 偶发把"转发视频"的 type 标成 DYNAMIC_TYPE_AV，但仍带 orig）----
+            is_forward = dtype == "DYNAMIC_TYPE_FORWARD" or (
+                bool(item.get("orig")) and isinstance(item.get("orig"), dict)
+            )
+            if is_forward:
+                self._parse_forward_body(item, result)
             # ---- 视频动态 ----
-            if dtype == "DYNAMIC_TYPE_AV":
+            elif dtype == "DYNAMIC_TYPE_AV":
+                # 作者UID ≠ 宿主UP的UID → 这是一条被转发的视频
+                # （B站 feed API 在 UP 转发时会额外生成一条不带 orig 的 DYNAMIC_TYPE_AV
+                #   卡片，module_author.mid 仍是原视频作者而非宿主UP，据此识别转发）
+                author_mid = str(mod_author.get("mid", ""))
+                if host_mid and author_mid and author_mid != str(host_mid):
+                    result["type_label"] = "转发"
+                else:
+                    result["type_label"] = "视频"
                 result["type"] = "video"
-                result["type_label"] = "视频"
                 archive = major.get("archive", {})
                 result["bvid"] = archive.get("bvid", "")
                 result["title"] = archive.get("title", "")
@@ -1008,68 +1120,24 @@ class BilibiliAPI:
                         url = pic.get("src") or pic.get("url", "")
                         if url:
                             result["images"].append(url)
+                elif major_type == "MAJOR_TYPE_BLOCKED":
+                    # 充电专属图文/文字动态：未充电用户看不到实际内容，
+                    # B站 返回屏蔽占位结构（blocked.hint_message 提示文案）。
+                    # 提取提示文案作为 text，避免前端渲染出空白卡片。
+                    blocked = major.get("blocked", {})
+                    hint = blocked.get("hint_message") or ""
+                    if isinstance(hint, str) and hint.strip():
+                        if not desc_text or len(hint.strip()) > len(desc_text):
+                            result["text"] = hint.strip()
+                else:
+                    # feed/space 对未充电的专属动态：module_dynamic 全空（desc/major 皆 null），
+                    # 唯一标记是 basic.is_only_fans=true。此时给通用提示文案，避免空白卡片。
+                    if (item.get("basic") or {}).get("is_only_fans"):
+                        hint = "专属动态：加入当前UP主的包月充电即可解锁观看"
+                        if not desc_text or len(hint) > len(desc_text):
+                            result["text"] = hint
 
-            # ---- 转发动态 ----
-            elif dtype == "DYNAMIC_TYPE_FORWARD":
-                result["type"] = "forward"
-                result["type_label"] = "转发"
-                # B站 转发的 orig 位置不固定：标准在 mod_dynamic.orig，部分动态(如该 UP 的
-                # 转发视频)会把完整 orig 放到 item.orig 顶层。两者兼容，否则取到 None 整段
-                # 视频提取/原文拼接全部落空，转发视频只剩转发者评论、无封面。
-                orig = mod_dynamic.get("orig") or item.get("orig") or {}
-                if orig:
-                    # orig 是一个完整的动态 item，内容通常嵌套在 orig.modules.module_dynamic 之下，
-                    # 但 B站 接口偶发把视频 archive 放到非标准位置（或 major.type 不是
-                    # MAJOR_TYPE_ARCHIVE），故先走标准路径，再从整棵 orig 树递归兜底找 bvid，
-                    # 确保转发视频不被漏掉、也不被误判为原作者的"投稿视频"。
-                    orig_modules = orig.get("modules") or {}
-                    orig_mod_dynamic = orig_modules.get("module_dynamic") or {}
-                    orig_desc = orig_mod_dynamic.get("desc") or {}
-                    # 转发的原动态里的表情也合并进映射
-                    result["emoji_map"].update(self._extract_emoji_map(orig_desc))
-                    orig_text = orig_desc.get("text", "")
-                    if orig_text:
-                        result["text"] += f"\n\n[转发内容]\n{orig_text}"
-                    # 提取转发的视频：标准路径取 orig.modules.module_dynamic.major.archive
-                    orig_major = orig_mod_dynamic.get("major") or {}
-                    orig_archive = orig_major.get("archive") or {}
-                    if not orig_archive.get("bvid"):
-                        # 兜底：整棵 orig 树递归找第一个含 bvid 的 archive
-                        # （兼容结构异常 / 嵌套转发 / major.type 非标准）
-                        orig_archive = self._find_archive_in_tree(orig) or {}
-                    if orig_archive.get("bvid"):
-                        result["bvid"] = orig_archive["bvid"]
-                        result["title"] = orig_archive.get("title", "")
-                        result["cover"] = orig_archive.get("cover", "")
-                        result["duration"] = self._extract_duration(orig_archive)
-                        result["type"] = "video"
-                        # 转发视频保留 type_label="转发"，与转发(文字/图文)统一归类，
-                        # 避免 TAB 栏出现多余的「视频(转发)」胶囊、且「转发」计数恒为 0。
-                        result["type_label"] = "转发"
-                        # 转发的是视频时，也从原动态判定 动态视频/投稿视频（用于命名模板 dynType 分类）
-                        orig_author = orig_modules.get("module_author") or {}
-                        result["dyn_video_type"] = self._classify_dyn_video(
-                            orig_author.get("pub_action")
-                        )
-                    else:
-                        # 转发的是 OPUS（图文/文字）：提取标题、正文、图片
-                        orig_major = orig_mod_dynamic.get("major") or {}
-                        if orig_major.get("type") == "MAJOR_TYPE_OPUS":
-                            opus = orig_major.get("opus", {})
-                            for pic in opus.get("pics", []):
-                                url = pic.get("url") or pic.get("src", "")
-                                if url:
-                                    result.setdefault("images", []).append(url)
-                            opus_title = opus.get("title")
-                            if isinstance(opus_title, dict):
-                                opus_title = opus_title.get("text", "")
-                            if opus_title and str(opus_title).strip():
-                                result["title"] = str(opus_title).strip()
-                            summary = opus.get("summary") or {}
-                            result["emoji_map"].update(self._extract_emoji_map(summary))
-                            opus_text = summary.get("text", "") if isinstance(summary, dict) else ""
-                            if opus_text and opus_text.strip():
-                                result["text"] += f"\n\n[转发内容]\n{opus_text.strip()}"
+            # 转发动态的处理已抽到 _parse_forward_body（见上方 if is_forward 分支调用）
 
             # 格式化时间（B站API返回的pub_ts可能是字符串，需转int）
             ts = result.get("timestamp", 0)
@@ -1084,6 +1152,75 @@ class BilibiliAPI:
         except Exception:
             # 动态解析失败不阻塞其他动态的处理，静默跳过
             return None
+
+    def _parse_forward_body(self, item, result):
+        """填充转发动态内容（被转发的内容在 item.orig 里）。
+
+        兼容 orig 位于 mod_dynamic.orig 或 item.orig 顶层两种结构；
+        orig 解析异常时不影响转发外壳（至少保留转发者评论/标题）。
+        """
+        result["type"] = "forward"
+        result["type_label"] = "转发"
+        modules = item.get("modules") or {}
+        mod_dynamic = modules.get("module_dynamic") or {}
+        # B站 转发的 orig 位置不固定：标准在 mod_dynamic.orig，部分动态(如该 UP 的
+        # 转发视频)会把完整 orig 放到 item.orig 顶层。两者兼容，否则取到 None 整段
+        # 视频提取/原文拼接全部落空，转发视频只剩转发者评论、无封面。
+        orig = mod_dynamic.get("orig") or item.get("orig") or {}
+        if not orig:
+            return
+        try:
+            orig_modules = orig.get("modules") or {}
+            orig_mod_dynamic = orig_modules.get("module_dynamic") or {}
+            orig_desc = orig_mod_dynamic.get("desc") or {}
+            # 转发的原动态里的表情也合并进映射
+            result["emoji_map"].update(self._extract_emoji_map(orig_desc))
+            orig_text = orig_desc.get("text", "")
+            if orig_text:
+                result["text"] += f"\n\n[转发内容]\n{orig_text}"
+            # 提取转发的视频：标准路径取 orig.modules.module_dynamic.major.archive
+            orig_major = orig_mod_dynamic.get("major") or {}
+            orig_archive = orig_major.get("archive") or {}
+            if not orig_archive.get("bvid"):
+                # 兜底：整棵 orig 树递归找第一个含 bvid 的 archive
+                # （兼容结构异常 / 嵌套转发 / major.type 非标准）
+                orig_archive = self._find_archive_in_tree(orig) or {}
+            if orig_archive.get("bvid"):
+                result["bvid"] = orig_archive["bvid"]
+                result["title"] = orig_archive.get("title", "")
+                result["cover"] = orig_archive.get("cover", "")
+                result["duration"] = self._extract_duration(orig_archive)
+                result["type"] = "video"
+                # 转发视频保留 type_label="转发"，与转发(文字/图文)统一归类，
+                # 避免 TAB 栏出现多余的「视频(转发)」胶囊、且「转发」计数恒为 0。
+                result["type_label"] = "转发"
+                # 转发的是视频时，也从原动态判定 动态视频/投稿视频（用于命名模板 dynType 分类）
+                orig_author = orig_modules.get("module_author") or {}
+                result["dyn_video_type"] = self._classify_dyn_video(
+                    orig_author.get("pub_action")
+                )
+            else:
+                # 转发的是 OPUS（图文/文字）：提取标题、正文、图片
+                orig_major = orig_mod_dynamic.get("major") or {}
+                if orig_major.get("type") == "MAJOR_TYPE_OPUS":
+                    opus = orig_major.get("opus", {})
+                    for pic in opus.get("pics", []):
+                        url = pic.get("url") or pic.get("src", "")
+                        if url:
+                            result.setdefault("images", []).append(url)
+                    opus_title = opus.get("title")
+                    if isinstance(opus_title, dict):
+                        opus_title = opus_title.get("text", "")
+                    if opus_title and str(opus_title).strip():
+                        result["title"] = str(opus_title).strip()
+                    summary = opus.get("summary") or {}
+                    result["emoji_map"].update(self._extract_emoji_map(summary))
+                    opus_text = summary.get("text", "") if isinstance(summary, dict) else ""
+                    if opus_text and opus_text.strip():
+                        result["text"] += f"\n\n[转发内容]\n{opus_text.strip()}"
+        except Exception:
+            # orig 解析异常不影响转发外壳（至少保留转发者评论/标题）
+            pass
 
     # -------------------- 视频下载 --------------------
 
@@ -1458,12 +1595,15 @@ class BilibiliAPI:
     def download_video(self, bvid, base_dir, task_id=None, qn=None,
                        folder_template=None, file_template=None, extra_vars=None,
                        max_duration=0, num_threads=3, target_page=None,
-                       use_stage=True, cache_root=None):
+                       use_stage=True, cache_root=None, max_pages=0):
         """下载视频完整流程，支持多P（分P）视频。
 
         - target_page=None：下载全部分P，每P一个独立文件（修复"只下第一P"）。
         - target_page=N（1-based）：只下载第 N 集。
         - max_duration：单P超长则跳过；多P时跳过该P，单P时整体跳过；0=不限。
+        - max_pages：仅下载前 N 集（1-based 截断）；0=不限。用于自动监控防爆盘
+          （如监控的 UP 发长番剧，避免一次性下几十 G）。与 target_page 互斥，
+          target_page 优先级更高。
         """
         if is_cancelled(task_id):
             raise DownloadCancelled()
@@ -1481,11 +1621,16 @@ class BilibiliAPI:
                       "duration": info.get("duration", 0)}]
         # 原始是否多P：决定单集下载时是否追加 _P{n} 文件名后缀
         is_multi_source = len(pages) > 1
-        # 指定只下某一P
+        # 指定只下某一P（优先级高于 max_pages）
         if target_page:
             pages = [p for p in pages if p.get("page") == int(target_page)]
             if not pages:
                 raise Exception(f"未找到第 {target_page} 集")
+        elif max_pages and max_pages > 0:
+            # 仅下前 N 集（防爆盘，常用于自动监控）
+            pages = pages[:int(max_pages)]
+            if not pages:
+                raise Exception(f"未找到前 {max_pages} 集内容")
 
         total_pages = len(pages)
 

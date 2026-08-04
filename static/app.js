@@ -159,6 +159,7 @@ async function searchByQuery(query) {
 
     currentData = data;
     currentData.video_limited = data.video_limited || false;
+    currentData.video_fallback = data.video_fallback || false;
     currentUid = data.user && data.user.uid ? String(data.user.uid) : "";
     videoTotal = data.video_total || data.videos.length;
     currentVideoPage = 1;
@@ -262,6 +263,22 @@ function removeFavUp(uid) {
 
 // ==================== 渲染 ====================
 
+// B站图片CDN缩略图：在 hdslb.com 图片 URL 末尾追加 @<width>w.webp 等比缩放参数，
+// 卡片缩略显示用，点击预览/下载仍用原图 URL。已带处理参数(@)或查询串、非 hdslb、gif 等不动。
+function thumbUrl(url, width = 160) {
+  if (!url) return url;
+  try {
+    const u = new URL(url);
+    if (!/hdslb\.com$/i.test(u.hostname)) return url;
+    if (u.pathname.includes("@") || u.search) return url;
+    const ext = (u.pathname.split(".").pop() || "").toLowerCase();
+    if (!["jpg", "jpeg", "png", "webp"].includes(ext)) return url;
+    return url + "@" + width + "w.webp";
+  } catch (e) {
+    return url;
+  }
+}
+
 // 秒级时间戳 → "2026年7月26日18时35分"（时/分零补齐，年/月/日不补）
 function formatBiliDateTime(ts) {
   const dt = new Date(ts * 1000);
@@ -293,6 +310,11 @@ function renderUser(user) {
   const uidEl = document.getElementById("userUid");
   if (uidEl) uidEl.textContent = (user.uid != null && user.uid !== 0) ? "UID: " + user.uid : "";
   document.getElementById("userSign").textContent = user.sign || "";
+  // 投稿数量：视频数（archive_count，navnum.video 校正）+ 图文数（album_count，navnum.album）
+  const vcEl = document.getElementById("userVideoCount");
+  if (vcEl) vcEl.textContent = (user.archive_count != null ? user.archive_count : "-");
+  const acEl = document.getElementById("userAlbumCount");
+  if (acEl) acEl.textContent = (user.album_count != null ? user.album_count : "-");
   // 等级徽章：按需求不展示用户等级，始终隐藏
   const lvEl = document.getElementById("userLevel");
   if (lvEl) lvEl.style.display = "none";
@@ -328,6 +350,18 @@ function renderCounts(videoCount, dynamicCount) {
   if (dc) dc.textContent = dynamicCount; // 「全部投稿」Tab 计数
 }
 
+// 显示/隐藏全选框：有内容(视频或动态)时显示。
+// 单独成函数，供 switchTab 与 loadDynPage 完成后统一调用，
+// 避免 switchTab 在筛选恢复分支 early return 时漏掉显示（selectAllArea 永远 display:none）。
+function updateSelectAllVisibility(tab) {
+  const selectAllArea = document.getElementById("selectAllArea");
+  if (!selectAllArea) return;
+  const hasContent = tab === "videos"
+    ? (videoTotal > 0)
+    : (dynLoaded > 0);
+  selectAllArea.style.display = hasContent ? "flex" : "none";
+}
+
 function switchTab(tab) {
   currentTab = tab;
   // 点击「全部投稿」Tab 时，若正处于某类型筛选，则回到"全部"视图（该 Tab 即代表全部）
@@ -343,13 +377,7 @@ function switchTab(tab) {
   });
 
   // 显示/隐藏全选框（视频或动态有内容时显示）
-  const selectAllArea = document.getElementById("selectAllArea");
-  if (selectAllArea) {
-    const hasContent = tab === "videos"
-      ? (videoTotal > 0)
-      : (dynLoaded > 0);
-    selectAllArea.style.display = hasContent ? "flex" : "none";
-  }
+  updateSelectAllVisibility(tab);
 
   const content = document.getElementById("content");
   if (!currentData) return;
@@ -383,6 +411,10 @@ function rerenderCurrentTab() {
 
 function renderVideos(videos) {
   if (!videos || videos.length === 0) {
+    // 区分「接口受限」与「真没有视频」：受限时提示去动态 Tab 或设置 Cookie
+    if (currentData && currentData.video_limited) {
+      return `<div class="empty"><div class="icon">⚠️</div><div>视频列表接口受限，暂无可用视频<br><small style="color:#8b949e">可前往【动态】标签查看/下载，或在右上角设置 Cookie 后重试</small></div></div>`;
+    }
     return `<div class="empty"><div class="icon">📭</div><div>该UP主没有视频</div></div>`;
   }
   const cards = videos
@@ -409,7 +441,7 @@ function renderVideos(videos) {
       <div class="card video-card">
         <div class="check-col">${checkbox}</div>
         <div class="vc-cover-wrap">
-          <img class="thumb" src="${v.cover}" alt="" loading="lazy"
+          <img class="thumb" src="${thumbUrl(v.cover, 320)}" alt="" loading="lazy"
                onerror="this.style.opacity=0.3">
           ${chargeBadge}
         </div>
@@ -431,7 +463,11 @@ function renderVideos(videos) {
   const pagination = renderPagination(currentVideoPage, totalPages, "loadVideoPage");
   // 后台探测哪些视频是多P，仅对多P显示 分P 按钮（microtask 在本次渲染写入 DOM 后执行）
   queueMicrotask(revealMultiP);
-  return `<div class="video-grid">${cards}</div>` + pagination;
+  // 降级提示条：视频列表接口受限时，当前展示的是动态流中的视频（非完整投稿）
+  const fallbackBanner = (currentData && currentData.video_fallback)
+    ? `<div class="video-fallback-banner">⚠️ 视频列表接口受限，以下为近期视频动态（非完整投稿列表），可到【动态】标签查看全部</div>`
+    : "";
+  return fallbackBanner + `<div class="video-grid">${cards}</div>` + pagination;
 }
 
 // 联合投稿抓取关键词（与 server.py JOINT_SUBMISSION_KEYWORDS 一致）
@@ -574,7 +610,7 @@ function renderDynamics(dynamics) {
     .map((d) => {
       const images = (d.images || [])
         .slice(0, 9)
-        .map((url) => `<img src="${url}" loading="lazy" onclick="previewImage('${url}')">`)
+        .map((url) => `<img src="${thumbUrl(url)}" loading="lazy" onclick="previewImage('${url}')">`)
         .join("");
       // 标题也走表情渲染：opus 图文的标题里可能含 [表情名] 占位符或 Unicode emoji
       const titleHtml = d.title ? `<div class="dy-title">${renderTextWithEmoji(d.title, d.emoji_map)}</div>` : "";
@@ -589,7 +625,7 @@ function renderDynamics(dynamics) {
         ? `<span class="dy-duration">${formatDuration(d.duration)}</span>` : "";
       const coverHtml = (d.type === "video" && d.cover)
         ? `<div class="dy-cover-wrap">
-             <img class="dy-cover" src="${d.cover}" loading="lazy" onclick="previewImage('${d.cover}')" onerror="this.style.display='none'">
+             <img class="dy-cover" src="${thumbUrl(d.cover, 320)}" loading="lazy" onclick="previewImage('${d.cover}')" onerror="this.style.display='none'">
              ${d.charge_only ? `<span class="dy-cover-badge">充电专属</span>` : ""}
              ${durationHtml}
            </div>`
@@ -771,6 +807,7 @@ async function loadDynPage(page, force) {
     const dc = document.getElementById("dynamicCount");
     if (dc) dc.textContent = dynLoaded;
     content.innerHTML = renderDynamics(currentData.dynamics);
+    updateSelectAllVisibility(currentTab);  // 筛选恢复分支 early return 时 switchTab 漏显示，这里补
     updateSelectAllCheckbox();
   } catch (e) {
     content.innerHTML = `<div class="empty"><div class="icon">💥</div><div>加载失败: ${e.message}</div></div>`;
@@ -797,6 +834,10 @@ async function loadVideoPage(page) {
     // 更新当前页的视频列表（保留其他数据不变）
     currentData.videos = data.videos;
     currentVideoPage = page;
+    // 记录降级状态（视频列表接口受限时后端从动态流兜底）
+    currentData.video_limited = data.limited || false;
+    currentData.video_fallback = data.fallback || false;
+    if (data.total !== undefined) videoTotal = data.total;
     // 标记已下载状态
     for (const v of data.videos) {
       v.downloaded = v.downloaded || isDownloadedCheck("0", v.bvid);
@@ -1124,15 +1165,18 @@ async function batchDownload() {
       return;
     }
     btn.disabled = true;
-    btn.textContent = "下载中...";
+    btn.textContent = "提交中...";
     toggleDownloadPanel(true);
     startPolling();
-    for (let i = 0; i < videos.length; i++) {
-      const v = videos[i];
-      btn.textContent = `下载中... (${i + 1}/${videos.length})`;
-      await downloadVideo(v.bvid, v.title, undefined, true, undefined, getFolderDynType(v));
-      selectedVideos.delete(v.bvid);
-      if (i < videos.length - 1) await sleep(1000);
+    // 并发提交：一次性全部提交到后端，真正下载并发由服务端 max_concurrent 控制（不再逐条 sleep 1s 串行）
+    let done = 0;
+    const BATCH = 10;
+    for (let i = 0; i < videos.length; i += BATCH) {
+      const chunk = videos.slice(i, i + BATCH);
+      btn.textContent = `提交中... (${Math.min(i + BATCH, videos.length)}/${videos.length})`;
+      await Promise.all(chunk.map(v => downloadVideo(v.bvid, v.title, undefined, true, undefined, getFolderDynType(v))));
+      done += chunk.length;
+      chunk.forEach(v => selectedVideos.delete(v.bvid));
     }
     if (skipped > 0) alert(`已跳过 ${skipped} 条被禁止下载的视频（可在下载设置里修改）`);
   } else {
@@ -1154,15 +1198,18 @@ async function batchDownload() {
       return;
     }
     btn.disabled = true;
-    btn.textContent = "下载中...";
+    btn.textContent = "提交中...";
     toggleDownloadPanel(true);
     startPolling();
-    for (let i = 0; i < dynamics.length; i++) {
-      const d = dynamics[i];
-      btn.textContent = `下载中... (${i + 1}/${dynamics.length})`;
-      await downloadDynamic(d, true);
-      selectedDynamics.delete(d.id);
-      if (i < dynamics.length - 1) await sleep(1000);
+    // 并发提交：一次性全部提交到后端，真正下载并发由服务端 max_concurrent 控制（不再逐条 sleep 1s 串行）
+    let done = 0;
+    const BATCH = 10;
+    for (let i = 0; i < dynamics.length; i += BATCH) {
+      const chunk = dynamics.slice(i, i + BATCH);
+      btn.textContent = `提交中... (${Math.min(i + BATCH, dynamics.length)}/${dynamics.length})`;
+      await Promise.all(chunk.map(d => downloadDynamic(d, true)));
+      done += chunk.length;
+      chunk.forEach(d => selectedDynamics.delete(d.id));
     }
     if (skipped > 0) alert(`已跳过 ${skipped} 条被禁止下载的动态（可在下载设置里修改）`);
   }
@@ -1564,7 +1611,7 @@ function renderDownloadPanel() {
       // 失败 / 取消：提供重试
       action = `<button class="dl-btn retry" title="重试" onclick="retryTask('${id}')">↺</button>`;
     }
-    // 下载成功的任务：不显示任何按钮（无需重试/删除）
+    // 下载成功的任务：不显示取消/重试按钮（无需重试/删除）
     return `
       <div class="dl-item ${t.status}">
         <div class="dl-row">
@@ -1721,6 +1768,10 @@ function openDlModal() {
     if (px) px.value = cfg.proxy || "";
     const sl = document.getElementById("speedLimitInput");
     if (sl) sl.value = cfg.speed_limit || "0";
+    const mc = document.getElementById("maxConcurrentInput");
+    if (mc) mc.value = cfg.max_concurrent || "2";
+    const mp = document.getElementById("maxPagesInput");
+    if (mp) mp.value = cfg.max_pages && String(cfg.max_pages) !== "0" ? cfg.max_pages : "0";
     // 下载类型复选框由 DYN_CATEGORIES 动态渲染（与 TAB 栏同步）；选中状态取自服务端配置，未配置则全选
     const dlTypes = cfg.download_types || [];
     renderDownloadTypeCheckboxes(dlTypes);
@@ -1738,6 +1789,7 @@ async function saveDlSettings() {
   const fl = document.getElementById("fileTemplateInput");
   const md = document.getElementById("maxDurationInput");
   const tc = document.getElementById("threadCountInput");
+  const mc = document.getElementById("maxConcurrentInput");
   const ac = document.getElementById("typeCheckGroup");
   const payload = {};
   if (inp) payload.download_dir = inp.value.trim();
@@ -1745,6 +1797,9 @@ async function saveDlSettings() {
   if (fl) payload.file_template = fl.value.trim();
   if (md) payload.max_duration = parseInt(md.value, 10) || 0;
   if (tc) payload.download_threads = Math.max(1, Math.min(8, parseInt(tc.value, 10) || 3));
+  if (mc) payload.max_concurrent = Math.max(1, Math.min(8, parseInt(mc.value, 10) || 2));
+  const mp = document.getElementById("maxPagesInput");
+  if (mp) payload.max_pages = Math.max(0, parseInt(mp.value, 10) || 0);
   const px = document.getElementById("proxyInput");
   if (px) payload.proxy = px.value.trim();
   const sl = document.getElementById("speedLimitInput");
@@ -1801,6 +1856,11 @@ async function loadAutoData() {
       sel.disabled = !(cfg.auto_schedule_enabled || false);
       sel.value = String(cfg.auto_interval || 1800);
     }
+    // 同步高级设置：风控冷却 / 完成通知（分P集数上限已统一到下载设置）
+    const cd = document.getElementById("autoCooldown");
+    if (cd) cd.value = cfg.auto_cooldown_minutes && String(cfg.auto_cooldown_minutes) !== "0" ? cfg.auto_cooldown_minutes : "";
+    const nu = document.getElementById("autoNotifyUrls");
+    if (nu) nu.value = cfg.notify_urls || "";
     // 查询最新状态
     if (autoUpList.length) {
       const sr = await fetch("/api/auto/status", {
@@ -1975,6 +2035,28 @@ async function saveAutoInterval() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ auto_interval: val }),
     });
+  } catch (e) { /* 忽略 */ }
+}
+// 保存自动化高级设置：风控冷却 / 完成通知 webhook（分P集数上限已统一到下载设置）
+async function saveAutoAdvanced() {
+  const cdEl = document.getElementById("autoCooldown");
+  const nuEl = document.getElementById("autoNotifyUrls");
+  const cooldown = cdEl && cdEl.value ? Math.max(0, parseInt(cdEl.value, 10) || 0) : 0;
+  const notify_urls = nuEl ? (nuEl.value || "").trim() : "";
+  try {
+    const r = await fetch("/api/config", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ auto_cooldown_minutes: cooldown, notify_urls }),
+    });
+    if (r.ok) {
+      const btn = document.querySelector("#autoModal .btn-primary[onclick='saveAutoAdvanced()']");
+      if (btn) {
+        const old = btn.textContent;
+        btn.textContent = "已保存";
+        setTimeout(() => { btn.textContent = old; }, 1500);
+      }
+    }
   } catch (e) { /* 忽略 */ }
 }
 async function toggleAutoUp(uid) {
@@ -2599,7 +2681,7 @@ function selfVideoCard(v, favName = "") {
   const dur = formatDuration(v.duration);
   const durHtml = dur ? `<span class="sc-duration">${dur}</span>` : "";
   const cover = v.cover
-    ? `<div class="sc-cover-wrap"><img class="sc-cover" src="${v.cover}" loading="lazy" onerror="this.style.display='none'">${durHtml}</div>`
+    ? `<div class="sc-cover-wrap"><img class="sc-cover" src="${thumbUrl(v.cover, 320)}" loading="lazy" onerror="this.style.display='none'">${durHtml}</div>`
     : "";
   const owner = v.owner_name ? `<div class="sc-owner">UP: ${escapeHtml(v.owner_name)}</div>` : "";
   const direct = v.bvid
