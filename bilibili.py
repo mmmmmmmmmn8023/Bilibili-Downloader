@@ -391,7 +391,13 @@ def render_template(template, variables):
         s = _re.sub(r'[\\/:*?"<>|#%&：？＊＂＇＜＞｜＼／]', "_", s)
         # 方案二：命名模板变量层把 emoji 替换为字面符号 [emoji]
         # （仅影响进入文件名/目录名的变量值；用户名/收藏夹名目录前缀走 sanitize_filename，不受影响）
-        s = _re.sub(r"[\U0001F000-\U0001FAFF\u2600-\u27BF\u2190-\u21FF\u2B00-\u2BFF\uFE0F\u200D]", "[emoji]", s)
+        # 注意：❤️ 由 U+2764 + U+FE0F 两个码点组成，必须「基础 emoji + 跟随修饰符(VS16/ZWJ/肤色)」
+        # 整体匹配一次替换为一个 [emoji]，否则变体选择符会被当成第二个 emoji
+        s = _re.sub(
+            r"[\U0001F000-\U0001FAFF\u2600-\u27BF\u2190-\u21FF\u2B00-\u2BFF][\uFE0F\u200D\U0001F3FB-\U0001F3FF]*",
+            "[emoji]", s)
+        # 清理孤立的变体选择符 / 零宽连接符（前面没有基础 emoji、单独出现的情况）
+        s = _re.sub(r"[\uFE0F\u200D]", "", s)
         return s
     # 单遍 re.sub + 单词边界，避免旧循环 replace 导致标题中的变量子串被二次替换
     _token_re = _re.compile(
