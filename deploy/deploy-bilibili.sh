@@ -21,15 +21,18 @@ BRANCH="develop/feature"
 
 echo "==> [$(date '+%F %T')] 开始部署 $REPO @ $BRANCH"
 
-# 首次克隆，之后拉取（纯 pull，绝不 push）
+# 首次克隆，之后拉取（纯拉取，绝不 push）
 if [ ! -d "$DIR/.git" ]; then
   echo "==> 首次克隆仓库到 $DIR"
   git clone -b "$BRANCH" "$REPO" "$DIR"
 else
   echo "==> 拉取最新代码"
   cd "$DIR"
-  # 仅快进合并，避免本地改动导致冲突；若有未跟踪的运行期文件（.gitignore 已排除）不受影响
-  git pull --ff-only origin "$BRANCH"
+  # 部署目录无需保留本地提交/改动，直接对齐远端（fetch + reset --hard）：
+  # 若远端历史被 force push 改写，git pull --ff-only 会因分支分叉而失败，reset 可避免；
+  # 运行期文件（config.json / download_history.json / downloads / logs）均未跟踪，不受影响
+  git fetch origin "$BRANCH"
+  git reset --hard "origin/$BRANCH"
 fi
 
 cd "$DIR"

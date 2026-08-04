@@ -58,6 +58,7 @@ services:
     ports:
       - "80:80"     # 仅用于 ACME 证书申请 / 续期验证
       - "443:443"   # 公网 HTTPS 入口
+      - "8888:8888" # 备用入口：域名:8888 直接访问
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile
       - caddy_data:/data      # 证书存储（切勿删除，否则需重新申请）
