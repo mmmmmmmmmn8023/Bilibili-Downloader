@@ -39,9 +39,18 @@ touch config.json download_history.json 2>/dev/null || true
 
 echo "==> [3/7] 预检 80 / 443 端口是否被占用"
 for port in 80 443; do
-  if docker ps --format '{{.Ports}}' | grep -q ":${port}->"; then
+  # 排除本项目自己的 caddy 容器（bilibili-caddy）：
+  # 重复部署时它本就占着 80/443，属正常情况，不应判定为冲突
+  conflict=$(docker ps --format '{{.Names}}\t{{.Ports}}' | grep ":${port}->" | grep -v '^bilibili-caddy' || true)
+  if [ -n "$conflict" ]; then
     echo "警告：检测到已有容器占用了宿主机 ${port} 端口，可能与 Caddy 冲突。"
+    echo "$conflict" | awk '{print "       冲突容器: " $1 "  端口: " $2}'
     echo "       请先停止冲突容器（docker ps 查看），否则 Caddy 启动会失败。"
+    if [ "${CI:-}" = "true" ] || [ ! -t 0 ]; then
+      echo "错误：当前为非交互环境（CI），无法等待确认，已终止部署。"
+      echo "       请先在服务器上执行 docker ps 停掉占用端口的容器，再重新部署。"
+      exit 1
+    fi
     read -r -p "是否仍要继续部署？(y/N) " answer
     if [ "${answer:-N}" != "y" ] && [ "${answer:-N}" != "Y" ]; then
       echo "已取消部署。"
