@@ -1452,15 +1452,43 @@ function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));
 }
 
+const STATUS_FAST_MS = 1500;   // 有活动任务或面板打开：高频
+const IDLE_POLL_MS = 10000;    // 空闲：低频兜底（仍可感知自动化下发的任务）
+
+// 是否存在未结束（排队/下载中/合并中）的任务
+function hasActiveTasks() {
+  for (const t of Object.values(downloadTasks)) {
+    if (t.status !== "done" && t.status !== "error" && t.status !== "cancelled") return true;
+  }
+  return false;
+}
+// 下载面板是否打开（无 collapsed 类即视为打开）
+function isDownloadPanelOpen() {
+  const p = document.getElementById("downloadPanel");
+  return !!p && !p.classList.contains("collapsed");
+}
+// 按需：面板打开 或 有活动任务 → 高频
+function statusNeedsFast() {
+  return isDownloadPanelOpen() || hasActiveTasks();
+}
+// 自适应轮询：根据当前是否需要高频决定下次间隔
+function schedulePoll() {
+  pollStatus().finally(() => {
+    pollTimer = setTimeout(schedulePoll, statusNeedsFast() ? STATUS_FAST_MS : IDLE_POLL_MS);
+  });
+}
 function startPolling() {
   if (pollTimer) return;
-  pollTimer = setInterval(pollStatus, 1500);
-  pollStatus(); // 立即查一次
+  schedulePoll();
 }
-
+// 打开面板/刚提交任务时立即拉一次，避免最多等 IDLE_POLL_MS
+function kickStatusPoll() {
+  if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
+  schedulePoll();
+}
 function stopPolling() {
   if (pollTimer) {
-    clearInterval(pollTimer);
+    clearTimeout(pollTimer);
     pollTimer = null;
   }
 }
@@ -1715,6 +1743,8 @@ function toggleDownloadPanel(force) {
   } else {
     p.classList.add("collapsed");
   }
+  // 打开面板时立即拉一次状态，避免空闲降频导致最多等 IDLE_POLL_MS
+  if (isDownloadPanelOpen()) kickStatusPoll();
 }
 
 
@@ -1838,7 +1868,7 @@ let autoRunning = false; // 自动化是否在运行
 function openAutoModal() {
   document.getElementById("autoModal").classList.add("show");
   loadAutoData();
-  startAutoLogPolling();
+  kickAutoLogPoll();
 }
 async function loadAutoData() {
   try {
@@ -1904,14 +1934,32 @@ function closeAutoModal() {
   document.getElementById("autoModal").classList.remove("show");
 }
 
-// ---- 自动化实时日志轮询 ----
+// ---- 自动化实时日志轮询（按需：自动化运行或弹窗打开才高频）----
+const AUTO_FAST_MS = 2000;     // 自动化运行中或弹窗打开：高频
+function isAutoModalOpen() {
+  const m = document.getElementById("autoModal");
+  return !!m && m.classList.contains("show");
+}
+// 按需：自动化正在运行 或 弹窗打开 → 高频
+function autoLogNeedsFast() {
+  return autoRunning || isAutoModalOpen();
+}
+function scheduleAutoLog() {
+  pollAutoLog().finally(() => {
+    autoLogTimer = setTimeout(scheduleAutoLog, autoLogNeedsFast() ? AUTO_FAST_MS : IDLE_POLL_MS);
+  });
+}
 function startAutoLogPolling() {
-  stopAutoLogPolling();
-  pollAutoLog();
-  autoLogTimer = setInterval(pollAutoLog, 2000);
+  if (autoLogTimer) return;
+  scheduleAutoLog();
+}
+// 打开弹窗时立即拉一次，避免最多等 IDLE_POLL_MS
+function kickAutoLogPoll() {
+  if (autoLogTimer) { clearTimeout(autoLogTimer); autoLogTimer = null; }
+  scheduleAutoLog();
 }
 function stopAutoLogPolling() {
-  if (autoLogTimer) { clearInterval(autoLogTimer); autoLogTimer = null; }
+  if (autoLogTimer) { clearTimeout(autoLogTimer); autoLogTimer = null; }
 }
 async function pollAutoLog() {
   try {
