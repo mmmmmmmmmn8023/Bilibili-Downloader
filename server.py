@@ -25,7 +25,7 @@ import urllib.request
 import bilibili
 from bilibili import (
     BilibiliAPI, download_tasks, update_task, sanitize_filename, dyn_folder_type_from_dynamic,
-    DownloadCancelled, cancel_task, is_cancelled, clear_cancel, _classify_error,
+    DownloadCancelled, cancel_task, is_cancelled, clear_cancel, clear_all_cancels, _classify_error, tasks_lock,
 )
 
 try:
@@ -76,7 +76,7 @@ _logger.addHandler(_file_handler)
 logging.getLogger("urllib3").setLevel(logging.WARNING)
 
 # 下载历史和配置的读写锁
-_file_lock = threading.Lock()
+_file_lock = threading.RLock()  # 可重入锁，允许 add_to_history 在读-改-写全程持锁
 
 # 默认画质：1080P
 _DEFAULT_QN = 80
@@ -130,14 +130,15 @@ def get_download_executor():
 def _autoclean_tasks():
     """任务总数过多时，清理最旧的已完成任务，保留最近的 TASK_KEEP_DONE 条。"""
     try:
-        if len(download_tasks) <= TASK_AUTO_CLEANUP_THRESHOLD:
-            return
-        finished = [tid for tid, t in download_tasks.items()
-                    if t.get("status") in ("done", "error", "cancelled")]
-        finished.sort(key=lambda tid: download_tasks[tid].get("time", 0))
-        remove = finished[:-TASK_KEEP_DONE] if len(finished) > TASK_KEEP_DONE else []
-        for tid in remove:
-            download_tasks.pop(tid, None)
+        with tasks_lock:
+            if len(download_tasks) <= TASK_AUTO_CLEANUP_THRESHOLD:
+                return
+            finished = [tid for tid, t in download_tasks.items()
+                        if t.get("status") in ("done", "error", "cancelled")]
+            finished.sort(key=lambda tid: download_tasks[tid].get("time", 0))
+            remove = finished[:-TASK_KEEP_DONE] if len(finished) > TASK_KEEP_DONE else []
+            for tid in remove:
+                download_tasks.pop(tid, None)
     except Exception:
         pass
 
@@ -219,29 +220,31 @@ def save_history(history):
 
 
 def add_to_history(data_dyid="0", bvid="0", title="", up_uid="", up_name=""):
-    raw = _load_history_raw()
-    did = _norm_val(data_dyid)
-    bv = _norm_val(bvid)
-    # 去重（跨分组全局）：data-dyid 或 bvid 任一命中即为重复（空值不参与）
-    for grp in raw:
-        for item in grp.get("records", []):
-            if did and item.get("data-dyid") == did:
-                return
-            if bv and item.get("bvid") == bv:
-                return
-    uid = str(up_uid or "")
-    grp = next((g for g in raw if g.get("up_uid") == uid), None)
-    if grp is None:
-        grp = {"up_uid": uid, "records": []}
-        raw.append(grp)
-    grp["records"].append({
-        "data-dyid": did,
-        "bvid": bv,
-        "title": title or "",
-        "time": time.strftime("%Y-%m-%d %H:%M"),
-        "up_name": up_name or "",
-    })
-    save_history(raw)
+    # 读-改-写全程持 _file_lock（RLock），防止并发写入互相覆盖
+    with _file_lock:
+        raw = _load_history_raw()
+        did = _norm_val(data_dyid)
+        bv = _norm_val(bvid)
+        # 去重（跨分组全局）：data-dyid 或 bvid 任一命中即为重复（空值不参与）
+        for grp in raw:
+            for item in grp.get("records", []):
+                if did and item.get("data-dyid") == did:
+                    return
+                if bv and item.get("bvid") == bv:
+                    return
+        uid = str(up_uid or "")
+        grp = next((g for g in raw if g.get("up_uid") == uid), None)
+        if grp is None:
+            grp = {"up_uid": uid, "records": []}
+            raw.append(grp)
+        grp["records"].append({
+            "data-dyid": did,
+            "bvid": bv,
+            "title": title or "",
+            "time": time.strftime("%Y-%m-%d %H:%M"),
+            "up_name": up_name or "",
+        })
+        save_history(raw)
 
 
 def is_downloaded(data_dyid="0", bvid="0"):
@@ -310,8 +313,7 @@ def _ensure_dyn_buffer(uid, api, target_count):
         try:
             batch, next_offset, has_more = api.fetch_dynamics_batch(uid, offset)
         except Exception:
-            with _dyn_lock:
-                _DYN_STATE.setdefault(uid, {"items": [], "offset": "", "has_more": True})["has_more"] = False
+            # 网络异常不置 has_more=False（下次调用仍可重试），仅回退本次翻页
             return
         with _dyn_lock:
             st = _DYN_STATE.setdefault(uid, {"items": [], "offset": "", "has_more": True})
@@ -402,6 +404,38 @@ def _dyn_type_counts(items):
         counts["联合投稿"] = joint
     return counts
 
+
+def _fallback_videos_from_dynamics(uid, api, page, per_page=12):
+    """视频列表接口(arc/search)受限时的降级数据源：从动态缓冲提取视频类动态。
+    动态缓冲按需翻页拉取（_ensure_dyn_buffer 自带限流），过滤 type=="video"
+    且 type_label=="视频" 的条目（投稿视频/动态视频，不含转发），转成视频卡
+    结构返回。返回 (videos, total, has_more)。
+    """
+    _ensure_dyn_buffer(uid, api, max(page * per_page, 12))
+    items, has_more, loaded, _ = _dyn_buffer_snapshot(uid)
+    dyn_videos = [
+        d for d in items
+        if d.get("type") == "video" and d.get("type_label") == "视频"
+    ]
+    total = len(dyn_videos)
+    start = (page - 1) * per_page
+    page_items = dyn_videos[start:start + per_page]
+    videos = []
+    for d in page_items:
+        videos.append({
+            "bvid": d.get("bvid", ""),
+            "title": d.get("title", ""),
+            "cover": d.get("cover", ""),
+            "duration": d.get("duration", ""),
+            "play": 0,  # 动态流不提供播放量，前端显示 ▶ 0
+            "created": d.get("timestamp", 0),
+            "description": "",
+            "charge_only": d.get("charge_only", False),
+            "dyid": d.get("id", ""),  # 动态id，供已下载判断（动态历史按 data-dyid）
+            "fallback": True,
+        })
+    return videos, total, has_more
+
 # ========================================================
 # 自动化下载后台线程
 # ========================================================
@@ -423,6 +457,45 @@ _auto_schedule_lock = threading.Lock()
 DEFAULT_AUTO_INTERVAL = 1800    # 默认 30 分钟
 MIN_AUTO_INTERVAL = 300         # 最短 5 分钟，防止误设过短触发风控
 
+
+def _auto_notify(cfg, label, total_new):
+    """自动检查结束后推送通知（webhook / Server酱 / 企业微信等）。
+
+    配置 notify_urls（逗号分隔的 URL 列表，支持 query 占位）：
+      - 普通 webhook：POST JSON {event, label, total_new, time}
+      - Server酱(https://sctapi.ftqq.com/SCTxxxx.send)：GET ?title=...&desp=...
+    未配置 notify_urls 则静默跳过。任意单条推送失败不影响其余。
+    """
+    raw = (cfg.get("notify_urls") or "").strip()
+    if not raw:
+        return
+    now = time.strftime("%Y-%m-%d %H:%M:%S")
+    urls = [u.strip() for u in raw.split(",") if u.strip()]
+    payload = {"event": "auto_check_done", "label": label, "total_new": total_new, "time": now}
+    for u in urls:
+        try:
+            if "sctapi.ftqq.com" in u or "sc.ftqq.com" in u:
+                # Server酱：GET，title/desp 做 URL 编码
+                title = urllib.parse.quote(f"[{label}] 自动下载完成")
+                desp = urllib.parse.quote(f"时间：{now}\n本次新增：{total_new} 条")
+                url = u + (f"&title={title}&desp={desp}" if "?" in u else f"?title={title}&desp={desp}")
+                req = urllib.request.Request(url, method="GET")
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    auto_log(f"通知已发送(Server酱) 状态={resp.status}")
+            else:
+                # 普通 webhook：POST JSON
+                data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+                req = urllib.request.Request(
+                    u, data=data,
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    auto_log(f"通知已发送(webhook {u}) 状态={resp.status}")
+        except Exception as e:
+            auto_log(f"通知发送失败({u}): {e}", "error")
+
+
 def _do_auto_check(label="定时检查"):
     """执行一次完整的自动化检查（所有启用 UP 主）。
     供手动触发和定时调度共用，内部加锁保证串行。
@@ -430,7 +503,10 @@ def _do_auto_check(label="定时检查"):
     """
     global _auto_busy
     _auto_busy = True
-    _auto_check_lock.acquire()
+    if not _auto_check_lock.acquire(timeout=300):
+        auto_log("上一次自动化检查仍在执行（超过 5 分钟），跳过本次", "warn")
+        _auto_busy = False
+        return
     try:
         cfg = load_config()
         uids = cfg.get("auto_uids") or []
@@ -439,9 +515,10 @@ def _do_auto_check(label="定时检查"):
             return
         cookie = cfg.get("sessdata", "")
         proxy = cfg.get("proxy", "")
-        speed_limit = int(cfg.get("speed_limit", 0) or 0)
-        api = BilibiliAPI(cookie, proxy=proxy, speed_limit=speed_limit) if cookie else BilibiliAPI(proxy=proxy, speed_limit=speed_limit)
+        # 注：拉动态列表不下载，speed_limit 对 fetch_dynamics_batch 无意义，故不传（下载由 _run_download 内部另行读取）。
+        api = BilibiliAPI(cookie, proxy=proxy) if cookie else BilibiliAPI(proxy=proxy)
         seen = set()
+        total_new = 0
         for u in uids:
             if not isinstance(u, dict):
                 uid = str(u) if u else ""
@@ -453,8 +530,10 @@ def _do_auto_check(label="定时检查"):
                 uname = u.get("name", uid)
             if uid:
                 auto_log(f"{label} {uname}({uid})")
-                _auto_download_up(api, uid, uname, seen)
-        auto_log(f"{label}完成")
+                total_new += _auto_download_up(api, uid, uname, seen)
+        auto_log(f"{label}完成，本次新增 {total_new} 条")
+        # 完成通知（webhook / Server酱等），配置为空则跳过
+        _auto_notify(cfg, label, total_new)
     except Exception as e:
         auto_log(f"{label}异常: {e}", "error")
     finally:
@@ -468,19 +547,25 @@ def _schedule_next_check():
     如果关闭则不安排下一次。
     """
     global _auto_schedule_timer
-    with _auto_schedule_lock:
-        cfg = load_config()
-        enabled = cfg.get("auto_schedule_enabled", False)
-        if not enabled:
-            auto_log("定时检查已关闭，停止调度")
+    try:
+        with _auto_schedule_lock:
+            cfg = load_config()
+            enabled = cfg.get("auto_schedule_enabled", False)
+            if not enabled:
+                auto_log("定时检查已关闭，停止调度")
+                _auto_schedule_timer = None
+                return
+            interval = max(MIN_AUTO_INTERVAL, int(cfg.get("auto_interval", DEFAULT_AUTO_INTERVAL) or DEFAULT_AUTO_INTERVAL))
+            _auto_schedule_timer = threading.Timer(interval, _run_scheduled_check)
+            _auto_schedule_timer.daemon = True
+            _auto_schedule_timer.start()
+            mm = interval // 60
+            auto_log(f"下一次定时检查: {mm} 分钟后")
+    except Exception:
+        # 异常时清除占位符，防止 start_auto_scheduler 误判"已在运行"而导致调度器无法恢复
+        with _auto_schedule_lock:
             _auto_schedule_timer = None
-            return
-        interval = max(MIN_AUTO_INTERVAL, int(cfg.get("auto_interval", DEFAULT_AUTO_INTERVAL) or DEFAULT_AUTO_INTERVAL))
-        _auto_schedule_timer = threading.Timer(interval, _run_scheduled_check)
-        _auto_schedule_timer.daemon = True
-        _auto_schedule_timer.start()
-        mm = interval // 60
-        auto_log(f"下一次定时检查: {mm} 分钟后")
+        raise
 
 
 def _run_scheduled_check():
@@ -539,17 +624,24 @@ def auto_log(msg, level="info"):
         _logger.info(msg)
 
 
-def _auto_submit(kind, params):
+# 单 UP 主自动检查连续失败计数（用于风控冷却退避，见 _auto_download_up）
+_auto_fail_count = {}
+_auto_fail_time = {}
+
+
+def _auto_submit(kind, params, retry_on_full=True):
     """通过内部 HTTP 复用统一下载队列（与前端点击下载走完全相同的代码路径）。
 
     这样自动下载也能：进「下载任务」面板（可见 / 可取消 / 重试）、使用全局画质 / 文件夹 /
     文件设置、独立缓存目录、与手动下载行为完全一致。
     kind: 'video' | 'dynamic'。server 是 ThreadingHTTPServer，内部 HTTP 自调用会开新线程处理，
     不会死锁。
+    retry_on_full: 当队列满（HTTP 429）时，做 1 次轻量延迟重试，避免瞬时并发打满导致漏下。
     """
-    try:
-        url = f"http://127.0.0.1:{PORT}/api/download/{kind}"
-        data = json.dumps(params, ensure_ascii=False).encode("utf-8")
+    url = f"http://127.0.0.1:{PORT}/api/download/{kind}"
+    data = json.dumps(params, ensure_ascii=False).encode("utf-8")
+
+    def _do_post():
         req = urllib.request.Request(
             url, data=data,
             headers={"Content-Type": "application/json"},
@@ -557,6 +649,21 @@ def _auto_submit(kind, params):
         )
         with urllib.request.urlopen(req, timeout=15) as resp:
             return resp.status == 200
+
+    try:
+        return _do_post()
+    except urllib.error.HTTPError as e:
+        # 队列满：做 1 次轻量延迟重试（其他错误直接失败）
+        if retry_on_full and getattr(e, "code", 0) == 429:
+            auto_log(f"自动提交队列已满({kind})，2 秒后重试 1 次")
+            time.sleep(2)
+            try:
+                return _do_post()
+            except Exception as e2:
+                auto_log(f"自动提交下载重试失败({kind}): {e2}", "error")
+                return False
+        auto_log(f"自动提交下载失败({kind}): {e}", "error")
+        return False
     except Exception as e:
         auto_log(f"自动提交下载失败({kind}): {e}", "error")
         return False
@@ -573,6 +680,11 @@ def _auto_download_up(api, uid, uname, seen=None):
         cfg = load_config()
         types = cfg.get("download_types") if "download_types" in cfg else ["投稿视频", "动态视频", "图文", "文字", "转发", "联合投稿"]
         cookie = cfg.get("sessdata", "")
+        # 风控冷却：连续失败达到阈值则该 UP 冷却 N 分钟，本次跳过（避免被风控时全量狂打）
+        cooldown_min = int(cfg.get("auto_cooldown_minutes", 30) or 0)
+        # 多 P 集数上限：0 表示不限（仅视频类生效）
+        max_pages = int(cfg.get("max_pages", 0) or 0)
+
         # 起始日期过滤
         cutoff_end = None
         cd = cfg.get("auto_cutoff_date", "")
@@ -582,6 +694,18 @@ def _auto_download_up(api, uid, uname, seen=None):
                 cutoff_end = datetime.strptime(cd, "%Y-%m-%d").timestamp() + 86400
             except Exception:
                 pass
+
+        # —— 风控冷却检查 ——
+        if cooldown_min > 0 and uid in _auto_fail_time:
+            last_fail = _auto_fail_time[uid]
+            fails = _auto_fail_count.get(uid, 0)
+            if fails >= 3 and (time.time() - last_fail) < cooldown_min * 60:
+                auto_log(f"{uname}({uid}): 近期连续失败 {fails} 次，冷却中（{cooldown_min} 分钟），本次跳过")
+                return 0
+            elif fails >= 3 and (time.time() - last_fail) >= cooldown_min * 60:
+                # 冷却结束，重置计数再试
+                _auto_fail_count[uid] = 0
+                _auto_fail_time.pop(uid, None)
 
         offset = ""
         total_new = 0
@@ -601,7 +725,12 @@ def _auto_download_up(api, uid, uname, seen=None):
                 continue
 
             empty_batch_count = 0
-            batch_all_old = True  # 本批是否全部已下载过
+            # passed_filter：本批是否有「通过类型+日期过滤」的动态。
+            # 与旧版 batch_all_old（是否有提交下载）不同 —— 即便本批全因类型/日期被跳过，
+            # 只要确实扫到了「该类型/日期范围内」的动态，就不应误判整批已下载而 break，
+            # 否则可能漏掉排在批后面、真正通过过滤的新内容。
+            passed_filter = False
+            sub_new = 0
 
             for d in dyns:
                 dtype = d.get("type", "")
@@ -630,6 +759,9 @@ def _auto_download_up(api, uid, uname, seen=None):
                 if label not in types:
                     continue
 
+                # 已通过类型+日期过滤，标记本批确有相关内容（用于「提前停」判据）
+                passed_filter = True
+
                 # 去重检查
                 is_old = False
                 if dtype == "video" and d.get("bvid"):
@@ -643,11 +775,12 @@ def _auto_download_up(api, uid, uname, seen=None):
                 if is_old:
                     continue
 
-                batch_all_old = False
+                sub_new += 1
 
                 # --- 提交下载 ---
                 if dtype == "video" and d.get("bvid"):
                     bvid = d["bvid"]
+                    # 原创视频与转发视频用不同 key 区分，避免互相“吃掉”下载
                     key = ("video", bvid)
                     if key in seen:
                         continue
@@ -656,7 +789,7 @@ def _auto_download_up(api, uid, uname, seen=None):
                         "dynamic": d,
                         "title": (d.get("title") or d.get("text") or "")[:30],
                         "username": uname, "uid": uid, "cookie": cookie,
-                        "task_type": "dynamic",
+                        "task_type": "dynamic", "max_pages": max_pages,
                     }
                     if _auto_submit("dynamic", params):
                         auto_log(f"{label} 已提交下载: {bvid} {d.get('title','')}")
@@ -665,7 +798,7 @@ def _auto_download_up(api, uid, uname, seen=None):
                         auto_log(f"{label} 提交失败: {bvid}", "error")
                 elif dtype == "forward" and d.get("bvid"):
                     bvid = d["bvid"]
-                    key = ("video", bvid)
+                    key = ("forward", bvid)
                     if key in seen:
                         continue
                     seen.add(key)
@@ -674,7 +807,7 @@ def _auto_download_up(api, uid, uname, seen=None):
                         "title": d.get("title", ""),
                         "username": uname, "uid": uid,
                         "dynType": dyn_folder_type_from_dynamic(d),
-                        "cookie": cookie, "task_type": "video",
+                        "cookie": cookie, "task_type": "video", "max_pages": max_pages,
                     }
                     if _auto_submit("video", params):
                         auto_log(f"{label} 已提交下载: {bvid} {d.get('title','')}")
@@ -691,7 +824,7 @@ def _auto_download_up(api, uid, uname, seen=None):
                         "dynamic": d,
                         "title": (d.get("title") or d.get("text") or "")[:30],
                         "username": uname, "uid": uid, "cookie": cookie,
-                        "task_type": "dynamic",
+                        "task_type": "dynamic", "max_pages": max_pages,
                     }
                     if _auto_submit("dynamic", params):
                         auto_log(f"{label} 已提交下载: {did}")
@@ -699,8 +832,12 @@ def _auto_download_up(api, uid, uname, seen=None):
                     else:
                         auto_log(f"{label} 提交失败: {did}", "error")
 
-            if batch_all_old and dyns:
-                auto_log(f"{uname}({uid}): 第 {batch_no} 批全部已下载，停止继续扫描")
+            # 整批扫完：若本批「有通过过滤的动态、且全部已下载」，则后续批次更老 -> 提前停止。
+            # 注意判据是 passed_filter（而非“有提交下载”）—— 即便本批全因去重/已下载被跳过，
+            # 只要它确属该类型+日期范围，就说明已扫到历史边界；反之若整批都被类型/日期过滤掉
+            # （passed_filter=False），则不提前停，继续翻页找真正的目标内容。
+            if passed_filter and sub_new == 0 and dyns:
+                auto_log(f"{uname}({uid}): 第 {batch_no} 批均为已下载内容，停止继续扫描")
                 break
 
             if not has_more or not next_offset:
@@ -710,11 +847,21 @@ def _auto_download_up(api, uid, uname, seen=None):
             offset = next_offset
             time.sleep(0.3)
 
+        # 成功扫完（无论是否有新内容都算本次成功），清除该 UP 失败计数
+        _auto_fail_count[uid] = 0
+        _auto_fail_time.pop(uid, None)
+
         if total_new == 0:
             auto_log(f"{uname}({uid}): 无新内容")
 
+        return total_new
+
     except Exception as e:
         auto_log(f"获取动态失败 uid={uid}: {e}", "error")
+        # 记录风控/接口失败，用于冷却退避
+        _auto_fail_count[uid] = _auto_fail_count.get(uid, 0) + 1
+        _auto_fail_time[uid] = time.time()
+        return 0
 
 
 
@@ -897,6 +1044,7 @@ class Handler(BaseHTTPRequestHandler):
                 "sign": "",
                 "level": 0,
                 "archive_count": 0,
+                "album_count": 0,
             }
             errors.append(f"用户信息: {e}")
 
@@ -913,6 +1061,13 @@ class Handler(BaseHTTPRequestHandler):
             video_source = result.get("source", "api")
             video_limited = result.get("limited", False)
             video_page = 1
+            # 视频列表接口受限时降级到动态流（首屏同逻辑，保证视频 Tab 有内容）
+            if video_limited:
+                try:
+                    videos, video_total, _ = _fallback_videos_from_dynamics(uid, api, 1, 12)
+                    video_source = "dynamic_fallback"
+                except Exception as e:
+                    errors.append(f"视频降级到动态流: {e}")
         except Exception as e:
             errors.append(f"视频列表: {e}")
 
@@ -976,6 +1131,7 @@ class Handler(BaseHTTPRequestHandler):
             "video_total": video_total,
             "video_source": video_source,
             "video_limited": video_limited,
+            "video_fallback": video_source == "dynamic_fallback",
             "video_page": video_page,
             "dynamics": dynamics,
             "dyn_has_more": dyn_has_more,
@@ -1012,14 +1168,28 @@ class Handler(BaseHTTPRequestHandler):
         try:
             result = api.get_user_videos(uid, page=page, page_size=12)
             videos = result["videos"]
+            limited = result.get("limited", False)
+            source = result.get("source", "api")
+            total = result["total"]
+            # 视频列表接口受限(-403等)时降级到动态流：从动态缓冲提取视频类动态，
+            # 保证视频 Tab 仍有内容可看（近期动态里的视频，非完整投稿列表）
+            if limited:
+                try:
+                    videos, total, _ = _fallback_videos_from_dynamics(uid, api, page, 12)
+                    source = "dynamic_fallback"
+                except Exception as e:
+                    _logger.warning("视频列表降级到动态流失败 uid=%s page=%s: %s", uid, page, e)
             # 标记已下载
             for v in videos:
-                v["downloaded"] = is_downloaded(bvid=v.get("bvid", ""))
+                v["downloaded"] = is_downloaded(
+                    data_dyid=str(v.get("dyid", "")), bvid=v.get("bvid", "")
+                )
             self._json({
                 "videos": videos,
-                "total": result["total"],
-                "source": result.get("source", "api"),
-                "limited": result.get("limited", False),
+                "total": total,
+                "source": source,
+                "limited": limited,
+                "fallback": source == "dynamic_fallback",
                 "page": page,
             })
         except Exception as e:
@@ -1305,7 +1475,8 @@ class Handler(BaseHTTPRequestHandler):
                     api.download_video(bvid, base_dir, task_id, qn=qn,
                                        folder_template=folder_tpl, file_template=file_tpl,
                                        max_duration=max_dur, num_threads=num_threads,
-                                       target_page=page, use_stage=use_cache, cache_root=cache_root)
+                                       target_page=page, use_stage=use_cache, cache_root=cache_root,
+                                       max_pages=params.get("max_pages", 0) or 0)
                 else:
                     base_dir = os.path.join(get_download_base(), sanitize_filename(params.get("username", "未知UP主")))
                     os.makedirs(base_dir, exist_ok=True)
@@ -1314,7 +1485,8 @@ class Handler(BaseHTTPRequestHandler):
                                        folder_template=folder_tpl, file_template=file_tpl,
                                        max_duration=max_dur, num_threads=num_threads,
                                        target_page=page, extra_vars=extra,
-                                       use_stage=use_cache, cache_root=cache_root)
+                                       use_stage=use_cache, cache_root=cache_root,
+                                       max_pages=params.get("max_pages", 0) or 0)
                 # 历史：整视频记 bvid；单集记 bvid#P{n}（互不影响，单集不会阻止整视频再下）
                 hist_id = f"{bvid}#P{page}" if page else bvid
                 add_to_history(data_dyid="0", bvid=hist_id, title=params.get("title", ""),
@@ -1331,7 +1503,8 @@ class Handler(BaseHTTPRequestHandler):
                                        max_duration=max_dur, num_threads=num_threads,
                                        extra_vars={"dynType": dyn_folder_type_from_dynamic(dynamic), "dynamicId": str(dynamic.get("id", ""))},
                                        target_page=page,
-                                       use_stage=use_cache, cache_root=cache_root)
+                                       use_stage=use_cache, cache_root=cache_root,
+                                       max_pages=params.get("max_pages", 0) or 0)
                     # 动态历史：整视频按 dynamic id；单集按 id#P{n}
                     dyn_hist_id = f"{dynamic.get('id')}#P{page}" if page else dynamic.get("id")
                     vid_hist_id = f"{dynamic['bvid']}#P{page}" if page else dynamic["bvid"]
@@ -1351,14 +1524,18 @@ class Handler(BaseHTTPRequestHandler):
             clear_cancel(task_id)
         except Exception as e:
             code, reason = _classify_error(e)
-            # 可恢复错误码：仅传输层/连接/超时类错误自动重试
+            # 可恢复错误码：传输层/连接/超时类错误，外加临时风控/限流类
+            # （BILI -352 风控、-412 请求拦截、BILI -509/-799 频繁限制、HTTP 412/HTTP 503）；
+            # 这类多为临时异常，稍后重试常能恢复，配合下方指数退避避免对风控接口狂打。
             RETRYABLE_CODES = frozenset({"CURL 7", "CURL 28", "CURL 92", "CURL 18", "CURL 35", "CURL 56", "CURL 6",
                                           "TIMEOUT", "CONN", "UNKNOWN",
-                                          "HTTP 500", "HTTP 502", "HTTP 503"})
+                                          "HTTP 500", "HTTP 502", "HTTP 503",
+                                          "BILI -352", "HTTP 412", "BILI -509", "BILI -799"})
             MAX_AUTO_RETRIES = 3
             RETRY_DELAYS = [30, 60, 120]  # 秒
-            t = download_tasks.get(task_id, {})
-            retry_count = t.get("retry", 0)
+            with tasks_lock:
+                t = download_tasks.get(task_id, {})
+                retry_count = t.get("retry", 0)
             if code in RETRYABLE_CODES and retry_count < MAX_AUTO_RETRIES:
                 delay = RETRY_DELAYS[retry_count] if retry_count < len(RETRY_DELAYS) else 120
                 retry_count += 1
@@ -1367,9 +1544,10 @@ class Handler(BaseHTTPRequestHandler):
                     f"下载失败，{delay}秒后自动重试 ({retry_count}/{MAX_AUTO_RETRIES})：{reason}",
                     error_code=code, error_detail=str(e)[:600],
                 )
-                t = download_tasks.get(task_id, {})
-                t["retry"] = retry_count
-                download_tasks[task_id] = t
+                with tasks_lock:
+                    t = download_tasks.get(task_id, {})
+                    t["retry"] = retry_count
+                    download_tasks[task_id] = t
                 # 延迟后回队列（新的 task_id 不变，完全复用 download_tasks 里的状态）
                 def _retry(task_id=task_id, kind=kind, params=params):
                     clear_cancel(task_id)
@@ -1393,25 +1571,29 @@ class Handler(BaseHTTPRequestHandler):
             )
         finally:
             clear_cancel(task_id)
-
     def _api_status(self):
         """查询所有下载任务的状态（前端轮询这个接口获取进度）"""
         _autoclean_tasks()
-        self._json({"tasks": dict(download_tasks)})
+        with tasks_lock:
+            snapshot = dict(download_tasks)
+        self._json({"tasks": snapshot})
 
     def _api_cancel_task(self, data):
         """取消一条进行中/排队的下载任务。"""
         task_id = data.get("task_id", "")
-        t = download_tasks.get(task_id)
-        if not t:
-            self._json({"ok": False, "error": "任务不存在"})
-            return
-        if t.get("status") in ("done", "error", "cancelled"):
+        with tasks_lock:
+            t = download_tasks.get(task_id)
+            if not t:
+                self._json({"ok": False, "error": "任务不存在"})
+                return
+            status = t.get("status")
+            progress = t.get("progress", 0)
+        if status in ("done", "error", "cancelled"):
             self._json({"ok": False, "error": "任务已结束，无法取消"})
             return
         # 标记取消：排队中的任务在 run 开头即退出；下载中的在循环检查点退出
         cancel_task(task_id)
-        update_task(task_id, "cancelling", t.get("progress", 0), "正在取消...")
+        update_task(task_id, "cancelling", progress, "正在取消...")
         self._json({"ok": True})
 
     def _task_bvid(self, t):
@@ -1425,25 +1607,26 @@ class Handler(BaseHTTPRequestHandler):
     def _api_retry_task(self, data):
         """重试一条失败/已取消的任务（用其保存的 params 重新入队）。"""
         task_id = data.get("task_id", "")
-        t = download_tasks.get(task_id)
-        if not t:
-            self._json({"ok": False, "error": "任务不存在"})
-            return
-        params = t.get("params")
+        with tasks_lock:
+            t = download_tasks.get(task_id)
+            if not t:
+                self._json({"ok": False, "error": "任务不存在"})
+                return
+            params = t.get("params")
+            dup_key = self._task_bvid(t) if params else ""
+            # 去重：若已有同 bvid/动态 id 的进行中任务，跳过重复提交，避免列表出现重复任务
+            if dup_key:
+                for tid, ot in list(download_tasks.items()):
+                    if tid == task_id:
+                        continue
+                    if ot.get("status") in ("queued", "downloading", "merging", "cancelling"):
+                        if self._task_bvid(ot) == dup_key:
+                            self._json({"ok": False, "reason": "active_exists",
+                                        "message": f"该视频正在下载中（任务 {tid[:6]}），已跳过重复提交"})
+                            return
         if not params:
             self._json({"ok": False, "error": "该任务缺少重试参数"})
             return
-        # 去重：若已有同 bvid/动态 id 的进行中任务，跳过重复提交，避免列表出现重复任务
-        dup_key = self._task_bvid(t)
-        if dup_key:
-            for tid, ot in download_tasks.items():
-                if tid == task_id:
-                    continue
-                if ot.get("status") in ("queued", "downloading", "merging", "cancelling"):
-                    if self._task_bvid(ot) == dup_key:
-                        self._json({"ok": False, "reason": "active_exists",
-                                    "message": f"该视频正在下载中（任务 {tid[:6]}），已跳过重复提交"})
-                        return
         kind = "video" if t.get("type") == "video" else "dynamic"
         # 用保存的 params 重新入队（新建 task_id，旧任务保留为历史）
         new_id = self._submit_download(kind, params)
@@ -1452,13 +1635,15 @@ class Handler(BaseHTTPRequestHandler):
     def _api_clear_tasks(self, data):
         """清理任务列表。scope: 'finished'=仅已完成(done)；'all'=全部（含失败/取消/进行中）。"""
         scope = data.get("scope", "finished")
-        if scope == "all":
-            download_tasks.clear()
-        else:
-            # 「清空已完成」只清真正成功的(done)；失败(error)/取消(cancelled)保留，便于重试/查看
-            for tid in list(download_tasks.keys()):
-                if download_tasks[tid].get("status") == "done":
-                    download_tasks.pop(tid, None)
+        with tasks_lock:
+            if scope == "all":
+                download_tasks.clear()
+                clear_all_cancels()  # 同步清理取消标记集
+            else:
+                # 「清空已完成」只清真正成功的(done)；失败(error)/取消(cancelled)保留，便于重试/查看
+                for tid in list(download_tasks.keys()):
+                    if download_tasks[tid].get("status") == "done":
+                        download_tasks.pop(tid, None)
         self._json({"ok": True})
 
     def _api_history(self):
@@ -1496,13 +1681,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def _api_get_config(self, params):
         config = load_config()
-        # 脱敏：不向前端返回明文 SESSDATA，仅告知是否已设置
+        # 本地部署：返回明文 SESSDATA（本机浏览器即用户本人，无脱敏必要）。
+        # 前端 initApp 依赖 data.sessdata 同步 cookie；脱敏会导致 cookie=undefined 连锁故障。
         cfg_out = dict(config)
-        if cfg_out.get("sessdata"):
-            cfg_out.pop("sessdata", None)
-            cfg_out["has_sessdata"] = True
-        else:
-            cfg_out["has_sessdata"] = False
+        cfg_out["has_sessdata"] = bool(cfg_out.get("sessdata"))
         self._json(cfg_out)
 
     def _api_save_config(self, data):
@@ -1524,7 +1706,11 @@ class Handler(BaseHTTPRequestHandler):
         self._json({"ok": True})
 
     def _api_auto_status(self, data):
-        """查询监控UP主的最新内容状态"""
+        """查询监控UP主的最新内容状态。
+
+        复用动态缓冲(_ensure_dyn_buffer / _DYN_STATE，TTL 5 分钟)，与手动检查/动态页共享，
+        前端每切到监控页不会狂打接口（同一 UP 5 分钟内只打一次真实请求）。
+        """
         uids_data = data.get("uids") or load_config().get("auto_uids") or []
         cookie = load_config().get("sessdata", "")
         types = load_config().get("download_types") if "download_types" in load_config() else ["投稿视频", "动态视频", "图文", "文字", "转发", "联合投稿"]
@@ -1534,10 +1720,11 @@ class Handler(BaseHTTPRequestHandler):
             uid = u.get("uid", u) if isinstance(u, dict) else str(u)
             if not uid: continue
             try:
-                dyns, _, _ = api.fetch_dynamics_batch(uid)
+                # 仅预拉首批（与自动化下载取最新内容的视角一致），命中缓冲则不打接口
+                _ensure_dyn_buffer(uid, api, 12)
+                items, _, _, _ = _dyn_buffer_snapshot(uid)
                 new = []
-                for d in (dyns or []):
-                    label = "未知"
+                for d in (items or []):
                     if d.get("charge_only"):
                         label = "充电专属"
                     elif _is_joint_submission(d):
@@ -1546,8 +1733,7 @@ class Handler(BaseHTTPRequestHandler):
                         label = {"video": "动态视频", "image": "图文", "text": "文字"}.get(d.get("type", ""), "转发")
                     if label not in types:
                         continue
-                    did = d.get("bvid", "") or str(d.get("id", ""))
-                    if not did or is_downloaded(bvid=d.get("bvid", "")) or is_downloaded(data_dyid=str(d.get("id", ""))):
+                    if is_downloaded(bvid=d.get("bvid", "")) or is_downloaded(data_dyid=str(d.get("id", ""))):
                         continue
                     new.append(d)
                 result[uid] = {"has_new": len(new) > 0, "count": len(new)}
@@ -1601,7 +1787,10 @@ class Handler(BaseHTTPRequestHandler):
             result = api.check_login()
         except Exception as e:
             result = {"login": False, "code": -1, "msg": str(e)}
-        result["has_sessdata"] = bool(cookie)  # 告知前端是否已设置，不回吐明文
+        # 本地部署：回传明文 SESSDATA（前端 verifyCookie 依赖 d.sessdata 同步 cookie 到 localStorage；
+        # 仅返回布尔会导致 cookie=undefined 连锁故障）。同时保留 has_sessdata 兼容旧前端。
+        result["has_sessdata"] = bool(cookie)
+        result["sessdata"] = cookie
         self._json(result)
 
     def _api_self(self, params):

@@ -35,6 +35,8 @@
       display: flex;
       align-items: center;
       gap: 8px;
+      white-space: nowrap;
+      flex-shrink: 0;
     }
     .navbar .logo svg { width: 28px; height: 28px; }
     .navbar .spacer { flex: 1; }
@@ -320,7 +322,8 @@
     }
     .user-info .stats {
       display: flex;
-      gap: 18px;
+      flex-wrap: wrap;
+      gap: 6px 18px;
       font-size: 13px;
       color: #7d8590;
     }
@@ -401,12 +404,8 @@
       flex: 1 1 100%;
       order: 1;
       min-width: 0;
-      /* 回退（旧浏览器）：可横向滚动，但 Y 方向裁切 */
-      overflow-x: auto;
-      overflow-y: hidden;
-      /* 现代浏览器：X 用 clip 裁切防页面横向溢出，Y 保持 visible，
-         这样胶囊 hover 的 translateY(-1px) 与 active 的柔光 box-shadow
-         在上下方向不再被裁切（之前 overflow-y:hidden 导致"显示不全"） */
+      /* X 用 clip 裁切防页面横向溢出，Y 保持 visible：
+         胶囊 hover 的 translateY(-1px) 与 active 的 box-shadow 不被裁切 */
       overflow-x: clip;
       overflow-y: visible;
       overflow-clip-margin: 10px;   /* 给左右两侧阴影留呼吸空间 */
@@ -607,6 +606,17 @@
     }
     .card:hover { border-color: #484f58; }
 
+    /* 视频列表接口受限时，从动态流降级展示的提示条 */
+    .video-fallback-banner {
+      margin: 12px 0 4px;
+      padding: 10px 14px;
+      border-radius: 8px;
+      background: #1c2128;
+      border: 1px solid #f0883e;
+      color: #f0883e;
+      font-size: 13px;
+    }
+
     /* 投稿视频卡片：竖向（封面在上，与「我的」页面 self-card 一致） */
     .video-grid {
       display: grid;
@@ -615,10 +625,10 @@
       margin: 12px 0;
     }
     .video-grid > .card { margin-bottom: 0; }
-    .video-card { flex-direction: column; position: relative; }
+    .video-card { display: flex; flex-direction: column; position: relative; }
     .video-card .thumb {
       width: 100%;
-      height: 130px;
+      aspect-ratio: 16 / 9;
       border-radius: 8px;
       object-fit: cover;
       background: #21262d;
@@ -658,20 +668,6 @@
       justify-content: center;
     }
     .dyn-grid > .card { margin-bottom: 0; }  /* 网格用 gap 控制间距，去掉卡片自带下边距 */
-    /* 窄屏优雅降级（默认 4 列，与 self-grid 一致） */
-    @media (max-width: 900px) {
-      .dyn-grid { grid-template-columns: repeat(3, 1fr); }
-      .video-grid { grid-template-columns: repeat(3, 1fr); }
-    }
-    @media (max-width: 680px) {
-      .dyn-grid { grid-template-columns: repeat(2, 1fr); }
-      .video-grid { grid-template-columns: repeat(2, 1fr); }
-    }
-    @media (max-width: 440px) {
-      .dyn-grid { grid-template-columns: 1fr; }
-      .video-grid { grid-template-columns: 1fr; }
-    }
-
     /* ===== 动态卡片 ===== */
     .dynamic-card {
       display: flex;
@@ -1141,6 +1137,10 @@
       border-radius: 6px;
     }
     .help-detail code { background: #21262d; padding: 1px 5px; border-radius: 3px; font-size: 12px; }
+    /* 下载设置表单标签（原 10 处重复内联样式抽取） */
+    .dl-form-label { font-size: 13px; color: #7d8590; margin-bottom: 4px; display: block; }
+    .dl-form-label.mb6 { margin-bottom: 6px; }
+    .dl-form-label > span { font-weight: 400; }
     .type-check-group {
       display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 16px;
     }
@@ -1195,21 +1195,29 @@
     .btn-text:hover { text-decoration: underline; }
 
     /* ===== 自动化下载弹窗布局优化 ===== */
-    .auto-modal-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 2px; }
+    .auto-modal { width: 560px; max-height: 92vh; overflow: hidden; display: flex; flex-direction: column; }
+    .auto-modal-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 2px; flex-shrink: 0; }
+    .auto-modal-body { flex: 1; overflow-y: auto; padding-right: 6px; margin-right: -6px; }
+    .auto-log-actions { display: flex; gap: 8px; }
     .auto-modal-head h3 { margin-bottom: 0; }
     .auto-hint { font-size: 12px; color: #7d8590; line-height: 1.6; margin-bottom: 8px; }
     .auto-date-row {
       display: flex; align-items: center; gap: 5px;
-      margin-bottom: 8px; height: 36px; padding: 0 10px;
+      width: 100%; max-width: 310px;
+      flex-wrap: wrap;
+      margin-bottom: 8px; min-height: 36px; padding: 6px 10px;
       background: #0d1117; border: 1px solid #21262d; border-radius: 6px;
     }
+    .auto-date-row.mt8 { margin-top: 8px; }
     .auto-date-row label { font-size: 11px; color: #c9d1d9; white-space: nowrap; }
     .auto-date-row input[type="date"] {
       background: #161b22; color: #e6edf3;
       border: 1px solid #30363d; border-radius: 4px;
       padding: 2px 6px; font-size: 12px; outline: none;
       cursor: pointer;
+      margin-bottom: 0; width: 104px;
     }
+    .auto-date-row input[type="date"] + .date-hint { margin-left: 5px; }
     .auto-date-row input[type="date"]:focus { border-color: #fb7299; }
     .auto-date-row .date-hint { font-size: 10px; color: #484f58; margin-left: auto; white-space: nowrap; }
     .auto-section-title { font-size: 13px; color: #c9d1d9; font-weight: 600; }
@@ -1217,6 +1225,7 @@
       display: inline-flex; align-items: center; gap: 4px;
       font-size: 11px; color: #7d8590; vertical-align: middle;
       background: #0d1117; border: 1px solid #30363d; border-radius: 8px; padding: 1px 7px;
+      margin-left: 6px;
     }
     .auto-run-pill .dot { width: 8px; height: 8px; border-radius: 50%; background: #30363d; }
     .auto-run-pill.running { color: #3fb950; border-color: #3fb95055; }
@@ -1234,7 +1243,26 @@
     .auto-up-quick a:hover { text-decoration: underline; }
     .auto-up-quick i { margin: 0 6px; color: #30363d; font-style: normal; }
     .auto-add-row { display: flex; gap: 6px; margin-top: 8px; }
-    .auto-add-row input { flex: 1; margin-bottom: 0; }
+    .auto-add-row input { flex: 1; min-width: 0; margin-bottom: 0; }
+    /* 高级设置分组（风控冷却 / 完成通知） */
+    .auto-adv-block { margin: 6px 0 8px; padding: 8px 10px; background: #161b22; border: 1px solid #30363d; border-radius: 8px; }
+    .auto-adv-title { font-size: 12px; color: #7d8590; margin-bottom: 6px; }
+    .auto-adv-row { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 14px; }
+    .auto-adv-label { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; font-size: 11px; color: #c9d1d9; }
+    .auto-adv-label .adv-name { width: 64px; flex-shrink: 0; text-align: right; }
+    .auto-adv-label .date-hint { font-size: 10px; color: #484f58; }
+    .auto-adv-input { width: 60px; padding: 2px 6px; background: #0d1117; color: #e6edf3; border: 1px solid #30363d; border-radius: 4px; font-size: 12px; outline: none; margin-bottom: 0; }
+    .auto-adv-notify { display: flex; flex: 1 1 280px; align-items: center; gap: 5px; white-space: nowrap; font-size: 11px; color: #c9d1d9; }
+    .auto-adv-notify input { flex: 1; min-width: 180px; box-sizing: border-box; padding: 5px 8px; background: #0d1117; border: 1px solid #30363d; border-radius: 4px; color: #e6edf3; font-size: 12px; outline: none; margin-bottom: 0; }
+    .auto-adv-save { margin-left: auto; padding: 6px 14px; }
+    .auto-adv-foot { font-size: 11px; color: #6e7681; margin-top: 4px; }
+    .auto-check-label { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; }
+    .auto-check-label input[type="checkbox"] { margin: 0; width: 16px; height: 16px; cursor: pointer; }
+    #autoIntervalSel { margin-left: 8px; width: 110px; margin-bottom: 0; }
+    #autoStatusBar { color: #fb7299; margin-left: 6px; }
+    /* 导航栏自动化运行指示胶囊 */
+    #autoFloat { display: none; align-items: center; gap: 8px; background: #21262d; border: 1px solid #30363d; border-radius: 16px; padding: 0 12px; font-size: 13px; color: #e6edf3; cursor: pointer; white-space: nowrap; height: 34px; flex-shrink: 0; }
+    #autoFloatDot { width: 8px; height: 8px; border-radius: 50%; background: #30363d; }
     @keyframes autoPulse { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
     @keyframes cs-pulse { 0%,100% { opacity: 1; } 50% { opacity: .5; } }
 
@@ -1562,9 +1590,22 @@
       grid-template-columns: repeat(4, 1fr);
       gap: 14px;
     }
-    @media (max-width: 900px) { .self-grid { grid-template-columns: repeat(3, 1fr); } }
-    @media (max-width: 680px) { .self-grid { grid-template-columns: repeat(2, 1fr); } }
-    @media (max-width: 440px) { .self-grid { grid-template-columns: 1fr; } }
+    /* 窄屏优雅降级：dyn/video/self 三种网格统一（默认 4 列 → 3 → 2 → 1） */
+    @media (max-width: 900px) {
+      .dyn-grid, .video-grid, .self-grid { grid-template-columns: repeat(3, 1fr); }
+    }
+    /* 移动端顶部导航：锁高，避免自动下载指示器出现时 logo 换行撑高 */
+    @media (max-width: 680px) {
+      .dyn-grid, .video-grid, .self-grid { grid-template-columns: repeat(2, 1fr); }
+      .navbar { padding: 10px 14px; gap: 10px; }
+      .navbar .logo { font-size: 16px; white-space: nowrap; flex-shrink: 0; }
+      .self-chip-name { display: none; }
+      .self-chip { padding: 3px; }
+    }
+    @media (max-width: 440px) {
+      .dyn-grid, .video-grid, .self-grid { grid-template-columns: 1fr; }
+      .navbar .logo { font-size: 15px; }
+    }
     .self-card {
       background: #161b22;
       border: 1px solid #30363d;
@@ -1641,14 +1682,14 @@
       B站下载器
     </div>
     <div class="spacer"></div>
-    <div id="autoFloat" onclick="openAutoModal()" style="display:none;align-items:center;gap:8px;background:#21262d;border:1px solid #30363d;border-radius:16px;padding:6px 12px;font-size:13px;color:#e6edf3;cursor:pointer;">
-      <span id="autoFloatDot" style="width:8px;height:8px;border-radius:50%;background:#30363d;"></span>
-      <span id="autoFloatText">自动下载中</span>
-    </div>
     <div class="self-chip hidden" id="selfChip" onclick="openSelfView()">
       <img class="self-chip-avatar" id="selfChipAvatar" src="" alt="">
       <span class="self-chip-fallback hidden" id="selfChipFallback"></span>
       <span class="self-chip-name" id="selfChipName"></span>
+    </div>
+    <div id="autoFloat" onclick="openAutoModal()">
+      <span id="autoFloatDot"></span>
+      <span id="autoFloatText">自动下载中</span>
     </div>
     <div class="nav-settings" id="navSettings">
       <button class="nav-settings-btn" onclick="toggleNavSettings(event)" title="设置">⚙</button>
@@ -1703,6 +1744,8 @@
         </div>
         <div class="sign" id="userSign"></div>
         <div class="stats">
+          <span class="stat"><b>投稿视频</b><span id="userVideoCount" class="uc-date">-</span></span>
+          <span class="stat"><b>图文</b><span id="userAlbumCount" class="uc-date">-</span></span>
           <span class="stat"><b>最新投稿</b><span id="userLastPost" class="uc-date">-</span><span id="userLastPostTitle" class="uc-sub"></span></span>
         </div>
       </div>
@@ -1869,7 +1912,7 @@
         <button class="history-close" onclick="closeDlModal()" title="关闭">&times;</button>
       </div>
       <div class="dl-modal-body">
-        <label style="font-size:13px;color:#7d8590;margin-bottom:4px;display:block;">下载画质</label>
+        <label class="dl-form-label">下载画质</label>
         <select id="qnSelectModal" class="qn-select-modal">
           <option value="127">最高画质</option>
           <option value="120">4K</option>
@@ -1878,21 +1921,25 @@
           <option value="32">480P</option>
           <option value="16">360P</option>
         </select>
-        <label style="font-size:13px;color:#7d8590;margin-bottom:6px;display:block;">下载类型</label>
+        <label class="dl-form-label mb6">下载类型</label>
         <div class="type-check-group" id="typeCheckGroup">
           <!-- 由 app.js 的 renderDownloadTypeCheckboxes() 从 DYN_CATEGORIES 动态渲染，与 TAB 栏同步 -->
         </div>
-        <label style="font-size:13px;color:#7d8590;margin-bottom:4px;display:block;">视频时长上限 <span style="font-weight:400;">(分钟，超过不下载，0=不限)</span></label>
+        <label class="dl-form-label">视频时长上限 <span>(分钟，超过不下载，0=不限)</span></label>
         <input type="number" id="maxDurationInput" placeholder="0" min="0">
-        <label style="font-size:13px;color:#7d8590;margin-bottom:4px;display:block;">下载线程数 <span style="font-weight:400;">(1-8，多线程提速)</span></label>
+        <label class="dl-form-label">下载线程数 <span>(1-8，多线程提速)</span></label>
         <input type="number" id="threadCountInput" placeholder="3" min="1" max="8">
-        <label style="font-size:13px;color:#7d8590;margin-bottom:4px;display:block;">HTTP 代理 <span style="font-weight:400;">(如 http://127.0.0.1:7890)</span></label>
+        <label class="dl-form-label">同时下载任务数 <span>(1-8，并发下载的视频数，2=默认)</span></label>
+        <input type="number" id="maxConcurrentInput" placeholder="2" min="1" max="8">
+        <label class="dl-form-label">分P集数上限 <span>(单个视频最多下载多少P，0=不限，避免多P番剧爆盘)</span></label>
+        <input type="number" id="maxPagesInput" placeholder="0" min="0">
+        <label class="dl-form-label">HTTP 代理 <span>(如 http://127.0.0.1:7890)</span></label>
         <input type="text" id="proxyInput" placeholder="留空=直连">
-        <label style="font-size:13px;color:#7d8590;margin-bottom:4px;display:block;">下载限速 <span style="font-weight:400;">(KB/s，0=不限速，限速时自动单线程)</span></label>
+        <label class="dl-form-label">下载限速 <span>(KB/s，0=不限速，限速时自动单线程)</span></label>
         <input type="number" id="speedLimitInput" placeholder="0" min="0">
-        <label style="font-size:13px;color:#7d8590;margin-bottom:4px;display:block;">下载保存位置</label>
+        <label class="dl-form-label">下载保存位置</label>
         <input type="text" id="downloadDirInput" placeholder="默认：程序目录下 downloads">
-        <label style="font-size:13px;color:#7d8590;margin-bottom:4px;display:block;">文件夹命名方式 <span class="help-btn" onclick="toggleHelp('folderHelp')" title="查看变量说明">?</span></label>
+        <label class="dl-form-label">文件夹命名方式 <span class="help-btn" onclick="toggleHelp('folderHelp')" title="查看变量说明">?</span></label>
         <input type="text" id="folderTemplateInput" placeholder="默认：视频">
         <div id="folderHelp" class="help-detail" style="display:none">
           <strong>可用变量：</strong><br>
@@ -1904,7 +1951,7 @@
           <strong>示例：</strong><br>
           <code>dynType</code> → 按类型分目录(投稿视频/图文/…) &nbsp; <code>pubdate/UpName-bvid</code> → 日期/UP主-BV号
         </div>
-        <label style="font-size:13px;color:#7d8590;margin-bottom:4px;display:block;">文件命名方式 <span class="help-btn" onclick="toggleHelp('fileHelp')" title="查看变量说明">?</span></label>
+        <label class="dl-form-label">文件命名方式 <span class="help-btn" onclick="toggleHelp('fileHelp')" title="查看变量说明">?</span></label>
         <input type="text" id="fileTemplateInput" placeholder="默认：avTitle">
         <div id="fileHelp" class="help-detail" style="display:none">
           <strong>可用变量：</strong><br>
@@ -1931,48 +1978,67 @@
         <h3>自动化下载</h3>
         <button class="history-close" onclick="closeAutoModal()" title="关闭">&times;</button>
       </div>
-      <p class="auto-hint">选择要监控的 UP 主，点击「立即检查」即可下载最新内容。</p>
-      <div class="auto-date-row" style="width:310px;">
-        <label>起始日期：</label>
-        <input type="date" id="autoCutoffDate" onchange="saveAutoCutoffDate()" style="margin-bottom:0;width:104px;">
-        <span class="date-hint" style="margin-left:5px;">只下载该日期之后的投稿</span>
-      </div>
-      <div class="auto-date-row" style="width:310px;margin-top:8px;">
-        <label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;">
-          <input type="checkbox" id="autoScheduleToggle" onchange="toggleAutoSchedule()" style="margin:0;width:16px;height:16px;">
-          <span>定时检查</span>
-        </label>
-        <select id="autoIntervalSel" onchange="saveAutoInterval()" disabled style="margin-left:8px;width:110px;margin-bottom:0;">
-          <option value="300">5 分钟</option>
-          <option value="600">10 分钟</option>
-          <option value="900">15 分钟</option>
-          <option value="1800" selected>30 分钟</option>
-          <option value="3600">1 小时</option>
-          <option value="7200">2 小时</option>
-          <option value="21600">6 小时</option>
-        </select>
-      </div>
-      <!-- 实时日志面板 -->
-      <div class="auto-log-block">
-        <div class="auto-log-head">
-          <span class="auto-section-title">实时日志 <span class="auto-run-pill" id="autoRunPill" style="margin-left:6px;"><i class="dot"></i><span id="autoRunText">空闲</span></span></span>
-          <span style="display:flex;gap:8px;">
-            <button class="btn-text" onclick="exportAutoLog()">导出</button>
-            <button class="btn-text" onclick="clearAutoLog()">清空</button>
-          </span>
+      <div class="auto-modal-body">
+        <p class="auto-hint">选择要监控的 UP 主，点击「立即检查」即可下载最新内容。</p>
+        <div class="auto-up-block">
+          <div class="auto-up-head">
+            <span class="auto-section-title">监控 UP 主 <span class="auto-sub">(点击切换启用/停用，× 移出列表)</span> <span id="autoStatusBar"></span></span>
+            <span class="auto-up-quick"><a onclick="enableAllAutoUp()">全选</a></span>
+          </div>
+          <div class="auto-up-list" id="autoUpList"></div>
+          <div class="auto-add-row">
+            <input type="text" id="autoUidInput" placeholder="输入 UID 或主页链接手动添加">
+            <button class="btn-primary" onclick="addAutoUpManually()">添加</button>
+            <button id="autoCheckBtn" class="btn-primary" onclick="manualAutoCheck()">立即检查</button>
+          </div>
         </div>
-        <div id="autoLog" class="auto-log"></div>
-      </div>
-      <div class="auto-up-block">
-        <div class="auto-up-head">
-          <span class="auto-section-title">监控 UP 主 <span class="auto-sub">(点击切换启用/停用，× 移出列表)</span> <span id="autoStatusBar" style="color:#fb7299;margin-left:6px;"></span></span>
-          <span class="auto-up-quick"><a onclick="enableAllAutoUp()">全选</a></span>
+        <div class="auto-date-row">
+          <label>起始日期：</label>
+          <input type="date" id="autoCutoffDate" onchange="saveAutoCutoffDate()">
+          <span class="date-hint">只下载该日期之后的投稿</span>
         </div>
-        <div class="auto-up-list" id="autoUpList"></div>
-        <div class="auto-add-row">
-          <input type="text" id="autoUidInput" placeholder="输入 UID 或主页链接手动添加">
-          <button class="btn-primary" onclick="addAutoUpManually()">添加</button>
-          <button id="autoCheckBtn" class="btn-primary" onclick="manualAutoCheck()">立即检查</button>
+        <div class="auto-date-row mt8">
+          <label class="auto-check-label">
+            <input type="checkbox" id="autoScheduleToggle" onchange="toggleAutoSchedule()">
+            <span>定时检查</span>
+          </label>
+          <select id="autoIntervalSel" onchange="saveAutoInterval()" disabled>
+            <option value="300">5 分钟</option>
+            <option value="600">10 分钟</option>
+            <option value="900">15 分钟</option>
+            <option value="1800" selected>30 分钟</option>
+            <option value="3600">1 小时</option>
+            <option value="7200">2 小时</option>
+            <option value="21600">6 小时</option>
+          </select>
+        </div>
+        <!-- 高级设置（分P集数上限已统一到下载设置） -->
+        <div class="auto-adv-block">
+          <div class="auto-adv-title">高级设置</div>
+          <div class="auto-adv-row">
+            <label class="auto-adv-label">
+              <span class="adv-name">风控冷却</span>
+              <input type="number" id="autoCooldown" class="auto-adv-input" min="0" placeholder="30">
+              <span class="date-hint">分钟，连续失败跳过该UP</span>
+            </label>
+            <label class="auto-adv-notify">
+              <span class="adv-name">完成通知</span>
+              <input type="text" id="autoNotifyUrls" placeholder="https://sctapi.ftqq.com/SCTxxxx.send 或 https://hooks.example.com/xxx">
+            </label>
+            <button class="btn-primary auto-adv-save" onclick="saveAutoAdvanced()">保存高级设置</button>
+          </div>
+          <div class="auto-adv-foot">完成通知：webhook/Server酱，逗号分隔，留空关闭</div>
+        </div>
+        <!-- 实时日志面板 -->
+        <div class="auto-log-block">
+          <div class="auto-log-head">
+            <span class="auto-section-title">实时日志 <span class="auto-run-pill" id="autoRunPill"><i class="dot"></i><span id="autoRunText">空闲</span></span></span>
+            <span class="auto-log-actions">
+              <button class="btn-text" onclick="exportAutoLog()">导出</button>
+              <button class="btn-text" onclick="clearAutoLog()">清空</button>
+            </span>
+          </div>
+          <div id="autoLog" class="auto-log"></div>
         </div>
       </div>
     </div>
@@ -2006,6 +2072,6 @@
     </div>
   </footer>
 
-  <script src="/static/app.js?v=20260803-44"></script>
+  <script src="/static/app.js?v=20260804-58"></script>
 </body>
 </html>
