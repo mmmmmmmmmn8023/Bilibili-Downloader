@@ -25,8 +25,9 @@ __DOMAIN__ {
         X-Frame-Options "DENY"
         # 跳转/加载不携带 Referer，避免内部路径泄露
         Referrer-Policy "no-referrer"
-        # 限制页面资源来源，降低 XSS 风险（仅允许同源脚本/样式）
-        Content-Security-Policy "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'"
+        # 限制页面资源来源，降低 XSS 风险。
+        # script-src 需含 'unsafe-inline'：页面按钮使用内联 onclick（index.html），严格 'self' 会全部拦截导致按钮失效
+        Content-Security-Policy "default-src 'self'; img-src 'self' data: https://*.hdslb.com; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'"
         # 强制 HTTPS（max-age 半年，含子域）
         Strict-Transport-Security "max-age=15768000; includeSubDomains"
         # 隐藏后端技术栈
