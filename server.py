@@ -23,6 +23,7 @@ from urllib.parse import urlparse, parse_qs
 import urllib.request
 
 import bilibili
+import db
 from bilibili import (
     BilibiliAPI, download_tasks, update_task, sanitize_filename, dyn_folder_type_from_dynamic,
     DownloadCancelled, cancel_task, is_cancelled, clear_cancel, clear_all_cancels, _classify_error, tasks_lock,
@@ -43,7 +44,6 @@ PORT = 8000
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
 DOWNLOAD_DIR = os.path.join(BASE_DIR, "downloads")
-HISTORY_FILE = os.path.join(BASE_DIR, "download_history.json")
 CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
 LOGS_DIR = os.path.join(BASE_DIR, "logs")
 
@@ -141,122 +141,6 @@ def _autoclean_tasks():
                 download_tasks.pop(tid, None)
     except Exception:
         pass
-
-
-def _norm_val(v):
-    """历史字段空值规范：None/空/"0" 统一为 ""。"""
-    v = v or ""
-    return "" if str(v) == "0" else v
-
-
-def _norm_record(r):
-    """把一条记录规范化：去掉 up_uid（由分组表达），空值转 ""。"""
-    if not isinstance(r, dict):
-        return {}
-    return {
-        "data-dyid": _norm_val(r.get("data-dyid")),
-        "bvid": _norm_val(r.get("bvid")),
-        "title": r.get("title") or "",
-        "time": r.get("time") or "",
-        "up_name": r.get("up_name") or "",
-    }
-
-
-def _load_history_raw():
-    """读取原始历史，返回 [{"up_uid": "...", "records": [...]}, ...]。
-    记录内不含 up_uid 字段（由分组表达）；空值统一为 ""。
-    兼容：旧 videos/dynamics dict → 返回空列表（不迁移）；
-          上一版 dict-by-uid / 扁平 list → 当场归一化（不写回）。"""
-    with _file_lock:
-        try:
-            with open(HISTORY_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except (FileNotFoundError, json.JSONDecodeError):
-            return []
-        # 旧格式 {"videos":[...], "dynamics":[...]} → 不迁移
-        if isinstance(data, dict) and ("videos" in data or "dynamics" in data):
-            return []
-        # 目标格式：数组 of 分组对象（含 "records" 键）
-        if isinstance(data, list):
-            if data and isinstance(data[0], dict) and "records" in data[0]:
-                return [{
-                    "up_uid": str(g.get("up_uid", "")),
-                    "records": [_norm_record(r) for r in g.get("records", []) if isinstance(r, dict)],
-                } for g in data if isinstance(g, dict)]
-            # 扁平 list（每条含 up_uid）→ 按 uid 分组
-            by_uid = {}
-            for r in data:
-                if not isinstance(r, dict):
-                    continue
-                uid = str(r.get("up_uid") or "0")
-                by_uid.setdefault(uid, []).append(_norm_record(r))
-            return [{"up_uid": uid, "records": lst} for uid, lst in by_uid.items()]
-        # 上一版 dict-by-uid：{uid: [records...]}
-        if isinstance(data, dict):
-            return [{
-                "up_uid": str(uid),
-                "records": [_norm_record(r) for r in lst if isinstance(r, dict)],
-            } for uid, lst in data.items() if isinstance(lst, list)]
-        return []
-
-
-def load_history():
-    """返回扁平 list（兼容所有调用方与前端），每条注入 up_uid。"""
-    raw = _load_history_raw()
-    out = []
-    for grp in raw:
-        uid = grp.get("up_uid", "")
-        for r in grp.get("records", []):
-            item = dict(r)
-            item["up_uid"] = uid
-            out.append(item)
-    return out
-
-
-def save_history(history):
-    with _file_lock:
-        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
-            json.dump(history, f, ensure_ascii=False, indent=2)
-
-
-def add_to_history(data_dyid="0", bvid="0", title="", up_uid="", up_name=""):
-    # 读-改-写全程持 _file_lock（RLock），防止并发写入互相覆盖
-    with _file_lock:
-        raw = _load_history_raw()
-        did = _norm_val(data_dyid)
-        bv = _norm_val(bvid)
-        # 去重（跨分组全局）：data-dyid 或 bvid 任一命中即为重复（空值不参与）
-        for grp in raw:
-            for item in grp.get("records", []):
-                if did and item.get("data-dyid") == did:
-                    return
-                if bv and item.get("bvid") == bv:
-                    return
-        uid = str(up_uid or "")
-        grp = next((g for g in raw if g.get("up_uid") == uid), None)
-        if grp is None:
-            grp = {"up_uid": uid, "records": []}
-            raw.append(grp)
-        grp["records"].append({
-            "data-dyid": did,
-            "bvid": bv,
-            "title": title or "",
-            "time": time.strftime("%Y-%m-%d %H:%M"),
-            "up_name": up_name or "",
-        })
-        save_history(raw)
-
-
-def is_downloaded(data_dyid="0", bvid="0"):
-    """查重：按 data-dyid 或 bvid 匹配，任一命中即已下载（空值不参与匹配）"""
-    did = _norm_val(data_dyid)
-    bv = _norm_val(bvid)
-    for item in load_history():
-        if did and item.get("data-dyid") == did:
-            return True
-        if bv and item.get("bvid") == bv:
-            return True
-    return False
 
 
 def load_config():
@@ -765,12 +649,12 @@ def _auto_download_up(api, uid, uname, seen=None):
                 # 去重检查
                 is_old = False
                 if dtype == "video" and d.get("bvid"):
-                    is_old = is_downloaded(data_dyid=str(d.get("id", "")), bvid=str(d.get("bvid", "")))
+                    is_old = db.is_downloaded(data_dyid=str(d.get("id", "")), bvid=str(d.get("bvid", "")))
                 elif dtype == "forward" and d.get("bvid"):
-                    is_old = is_downloaded(data_dyid=str(d.get("id", "")), bvid=str(d.get("bvid", "")))
+                    is_old = db.is_downloaded(data_dyid=str(d.get("id", "")), bvid=str(d.get("bvid", "")))
                 else:
                     did = d.get("id", "")
-                    is_old = bool(did) and is_downloaded(data_dyid=did)
+                    is_old = bool(did) and db.is_downloaded(data_dyid=did)
 
                 if is_old:
                     continue
@@ -1121,9 +1005,9 @@ class Handler(BaseHTTPRequestHandler):
 
         # 读取下载历史，标记已下载的项目
         for v in videos:
-            v["downloaded"] = is_downloaded(bvid=v.get("bvid", ""))
+            v["downloaded"] = db.is_downloaded(bvid=v.get("bvid", ""))
         for d in dynamics:
-            d["downloaded"] = is_downloaded(data_dyid=str(d.get("id", "")), bvid=str(d.get("bvid", "")))
+            d["downloaded"] = db.is_downloaded(data_dyid=str(d.get("id", "")), bvid=str(d.get("bvid", "")))
 
         result = {
             "user": user,
@@ -1181,7 +1065,7 @@ class Handler(BaseHTTPRequestHandler):
                     _logger.warning("视频列表降级到动态流失败 uid=%s page=%s: %s", uid, page, e)
             # 标记已下载
             for v in videos:
-                v["downloaded"] = is_downloaded(
+                v["downloaded"] = db.is_downloaded(
                     data_dyid=str(v.get("dyid", "")), bvid=v.get("bvid", "")
                 )
             self._json({
@@ -1262,7 +1146,7 @@ class Handler(BaseHTTPRequestHandler):
 
         # 标记已下载（与服务端历史比对；前端还会用本地集合再合并）
         for d in page_items:
-            d["downloaded"] = is_downloaded(data_dyid=str(d.get("id", "")), bvid=str(d.get("bvid", "")))
+            d["downloaded"] = db.is_downloaded(data_dyid=str(d.get("id", "")), bvid=str(d.get("bvid", "")))
 
         self._json({
             "dynamics": page_items,
@@ -1292,11 +1176,11 @@ class Handler(BaseHTTPRequestHandler):
 
         # 去重：整视频按 bvid；单集按 bvid#P{n}（互不影响）
         if page:
-            if is_downloaded(bvid=f"{bvid}#P{page}"):
+            if db.is_downloaded(bvid=f"{bvid}#P{page}"):
                 self._json({"task_id": "", "already_downloaded": True})
                 return
         else:
-            if is_downloaded(bvid=bvid):
+            if db.is_downloaded(bvid=bvid):
                 self._json({"task_id": "", "already_downloaded": True})
                 return
 
@@ -1368,12 +1252,12 @@ class Handler(BaseHTTPRequestHandler):
 
         # 已下载去重：整视频按 dynamic id / bvid；单集按 id#P{n}（互不影响）
         dyn_hist_id = f"{dynamic_id}#P{page}" if page else dynamic_id
-        if is_downloaded(data_dyid=dyn_hist_id):
+        if db.is_downloaded(data_dyid=dyn_hist_id):
             self._json({"task_id": "", "already_downloaded": True})
             return
         bvid = dynamic.get("bvid", "")
         vid_hist_id = f"{bvid}#P{page}" if (bvid and page) else bvid
-        if bvid and is_downloaded(bvid=vid_hist_id):
+        if bvid and db.is_downloaded(bvid=vid_hist_id):
             self._json({"task_id": "", "already_downloaded": True})
             return
 
@@ -1425,7 +1309,7 @@ class Handler(BaseHTTPRequestHandler):
                 _bvid = params.get("bvid", "")
                 _page = params.get("page")
                 _hid = f"{_bvid}#P{_page}" if _page else _bvid
-                if _bvid and is_downloaded(bvid=_hid):
+                if _bvid and db.is_downloaded(bvid=_hid):
                     update_task(task_id, "done", 100, "已完成（资源已下载，已跳过）")
                     return
             else:
@@ -1434,10 +1318,10 @@ class Handler(BaseHTTPRequestHandler):
                 _did = _dyn.get("id", "")
                 _dbvid = _dyn.get("bvid", "")
                 if _dtype == "video" and _dbvid:
-                    if is_downloaded(data_dyid=str(_did), bvid=str(_dbvid)):
+                    if db.is_downloaded(data_dyid=str(_did), bvid=str(_dbvid)):
                         update_task(task_id, "done", 100, "已完成（资源已下载，已跳过）")
                         return
-                elif _did and is_downloaded(data_dyid=_did):
+                elif _did and db.is_downloaded(data_dyid=_did):
                     update_task(task_id, "done", 100, "已完成（资源已下载，已跳过）")
                     return
             cookie = params.get("cookie", "")
@@ -1489,7 +1373,7 @@ class Handler(BaseHTTPRequestHandler):
                                        max_pages=params.get("max_pages", 0) or 0)
                 # 历史：整视频记 bvid；单集记 bvid#P{n}（互不影响，单集不会阻止整视频再下）
                 hist_id = f"{bvid}#P{page}" if page else bvid
-                add_to_history(data_dyid="0", bvid=hist_id, title=params.get("title", ""),
+                db.add_to_history(data_dyid="0", bvid=hist_id, title=params.get("title", ""),
                                 up_uid=params.get("uid", ""), up_name=params.get("username", ""))
             else:
                 dynamic = params["dynamic"]
@@ -1508,7 +1392,7 @@ class Handler(BaseHTTPRequestHandler):
                     # 动态历史：整视频按 dynamic id；单集按 id#P{n}
                     dyn_hist_id = f"{dynamic.get('id')}#P{page}" if page else dynamic.get("id")
                     vid_hist_id = f"{dynamic['bvid']}#P{page}" if page else dynamic["bvid"]
-                    add_to_history(data_dyid=dyn_hist_id, bvid=vid_hist_id,
+                    db.add_to_history(data_dyid=dyn_hist_id, bvid=vid_hist_id,
                                     title=dynamic.get("title", "")[:30],
                                     up_uid=params.get("uid", ""), up_name=params.get("username", ""))
                 else:
@@ -1516,7 +1400,7 @@ class Handler(BaseHTTPRequestHandler):
                                          folder_template=folder_tpl, file_template=file_tpl,
                                          uid=str(params.get("uid", "")), up_name=params.get("username", ""),
                                          use_stage=use_cache, cache_root=cache_root)
-                    add_to_history(data_dyid=dynamic.get("id"), bvid="0",
+                    db.add_to_history(data_dyid=dynamic.get("id"), bvid="0",
                                     title=dynamic.get("title", dynamic.get("text", "")[:30]),
                                     up_uid=params.get("uid", ""), up_name=params.get("username", ""))
         except DownloadCancelled:
@@ -1647,36 +1531,21 @@ class Handler(BaseHTTPRequestHandler):
         self._json({"ok": True})
 
     def _api_history(self):
-        self._json(load_history())
+        self._json(db.load_history())
 
     def _api_clear_history(self, data=None):
         data = data or {}
         uid = str(data.get("uid") or "").strip()
-        raw = _load_history_raw()
-        if uid:
-            raw = [g for g in raw if g.get("up_uid") != uid]
-        else:
-            raw = []
-        save_history(raw)
+        db.clear_history(uid)
         self._json({"ok": True, "uid": uid or None})
 
     def _api_history_remove(self, data):
-        dyid = _norm_val(data.get("dyid") or data.get("id"))
-        bvid = _norm_val(data.get("bvid"))
+        dyid = db._norm_val(data.get("dyid") or data.get("id"))
+        bvid = db._norm_val(data.get("bvid"))
         if not dyid and not bvid:
             self._json({"error": "missing dyid/bvid"}, 400)
             return
-        raw = _load_history_raw()
-        changed = False
-        for grp in raw:
-            new_lst = [x for x in grp.get("records", [])
-                       if not (dyid and str(x.get("data-dyid", "")) == dyid)
-                       and not (bvid and str(x.get("bvid", "")) == bvid)]
-            if len(new_lst) != len(grp.get("records", [])):
-                grp["records"] = new_lst
-                changed = True
-        if changed:
-            save_history(raw)
+        db.remove_history(dyid, bvid)
         self._json({"ok": True})
 
     def _api_get_config(self, params):
@@ -1733,7 +1602,7 @@ class Handler(BaseHTTPRequestHandler):
                         label = {"video": "动态视频", "image": "图文", "text": "文字"}.get(d.get("type", ""), "转发")
                     if label not in types:
                         continue
-                    if is_downloaded(bvid=d.get("bvid", "")) or is_downloaded(data_dyid=str(d.get("id", ""))):
+                    if db.is_downloaded(bvid=d.get("bvid", "")) or db.is_downloaded(data_dyid=str(d.get("id", ""))):
                         continue
                     new.append(d)
                 result[uid] = {"has_new": len(new) > 0, "count": len(new)}
@@ -1954,6 +1823,8 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+    # 初始化下载历史数据库（SQLite），首次运行自动建表
+    db.init_db()
     # 根据配置初始化 TLS 校验开关（默认 insecure_tls=true → 不校验，兼容代理/抓包）
     bilibili.VERIFY_SSL = not load_config().get("insecure_tls", True)
     # 监听地址：默认仅本机 127.0.0.1（安全，不对外暴露）

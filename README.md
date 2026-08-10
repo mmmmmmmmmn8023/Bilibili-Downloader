@@ -78,7 +78,7 @@ ffmpeg/               内置 FFmpeg（Windows）
 start.bat             Windows 一键启动
 requirements.txt      依赖（curl_cffi / qrcode / Pillow）
 config.json           运行配置（自动生成，勿提交）
-download_history.json 下载历史（自动生成，勿提交）
+bili_history.db*       下载历史（SQLite，自动生成，勿提交）
 logs/                 运行日志（自动生成）
 ```
 
@@ -130,7 +130,7 @@ logs/                 运行日志（自动生成）
 
 ## 安全须知
 
-- **切勿提交 `config.json` 与 `download_history.json`**：两者均含隐私（登录态 / 下载记录），已写入 `.gitignore`。
+- **切勿提交 `config.json` 与 `bili_history.db*`**：两者均含隐私（登录态 / 下载记录），已写入 `.gitignore`。
 - 服务器**不向前端返回明文 SESSDATA**（`/api/config`、`/api/check_cookie` 仅告知是否已设置）。
 - 默认仅本机访问；若需局域网共享，请知悉风险并自行配置防火墙。
 
@@ -143,7 +143,7 @@ A：未登录时 B站 限制画质最高 480P；填入 SESSDATA 后可解锁更�
 A：检查代理（`proxy`）与限速（`speed_limit`）设置；批量请求已内置限流（约 0.3s/请求）与重试退避，触发风控（错误码 -412 / -352）时会自动重试。
 
 **Q：如何备份我的数据？**  
-A：保留 `downloads/`、`config.json`、`download_history.json`、`logs/` 即可。`config.json` 与 `download_history.json` 已纳入 `.gitignore`，请勿误提交。
+A：保留 `downloads/`、`config.json`、`bili_history.db*`、`logs/` 即可。`config.json` 与 `bili_history.db*` 已纳入 `.gitignore`，请勿误提交。
 
 ## 许可证
 
