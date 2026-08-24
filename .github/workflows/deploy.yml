@@ -53,10 +53,15 @@ jobs:
           echo "==> 通过 SSH 连接 ${SSH_USER}@${SSH_HOST}:${SSH_PORT} 执行部署脚本"
 
           # 跳过主机指纹确认（CI 无交互必需）；仅限可信网络使用
+          # 注：先强制清理服务器克隆目录的本地改动并对齐远端，再调用部署脚本。
+          # 原因：服务器 /var/www/deploy-bilibili.sh 是手动放置的旧副本，可能用 git pull（merge）
+          #       而非 reset --hard；若克隆目录有未提交改动（如 db.py/deploy.sh），pull 会因
+          #       “would be overwritten by merge” 中止整个部署。此处先 discard + reset 可彻底规避，
+          #       且与仓库内 deploy-bilibili.sh 的 reset --hard 行为保持一致。DIR/BRANCH 需与该脚本一致。
           ssh -o StrictHostKeyChecking=no \
               -o UserKnownHostsFile=/dev/null \
               -p "${SSH_PORT}" \
               "${SSH_USER}@${SSH_HOST}" \
-              "bash ${DEPLOY_SCRIPT}"
+              "if [ -d /var/www/Bilibili-Downloader/.git ]; then cd /var/www/Bilibili-Downloader && git fetch origin develop/feature && git checkout -- . && git reset --hard origin/develop/feature; fi; bash ${DEPLOY_SCRIPT}"
 
           echo "==> 部署命令已执行完毕"
