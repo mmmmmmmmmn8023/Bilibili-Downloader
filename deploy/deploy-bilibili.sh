@@ -41,10 +41,19 @@ cd "$DIR"
 # ⚠️ bili_history.db 也必须 touch：它是 SQLite 单文件库，若主机不存在，Docker 会建成一个
 #    目录，sqlite3 打开失败 → server 启动即崩溃（容器 unhealthy）。这是持久化卷新增后漏的一项。
 for f in config.json download_history.json bili_history.db; do
-  # 若上一轮部署已误建为目录，先删掉再建文件，避免 sqlite 打开失败
-  if [ -d "$f" ]; then rm -rf "$f"; fi
+  # 若上一轮部署已误建为目录：先抢救目录里可能藏着的同名真实文件
+  # （例如用户曾把自己的 bili_history.db 复制到服务器，却被 Docker 建成的目录“吞”进去，
+  #   真实库落在 ./bili_history.db/bili_history.db）。不抢救直接 rm 会丢历史，故先挪到 /tmp。
+  if [ -d "$f" ]; then
+    if [ -f "$f/$f" ]; then mv "$f/$f" "/tmp/${f}.rescued"; fi
+    rm -rf "$f"
+  fi
   touch "$f"
 done
+# 若上面抢救出了真实库（仅 bili_history.db 有意义），覆盖刚建的空文件；config/download_history 等可丢弃
+if [ -f "/tmp/bili_history.db.rescued" ]; then
+  cp "/tmp/bili_history.db.rescued" bili_history.db
+fi
 mkdir -p downloads logs
 
 # 关键：调用仓库自带的 deploy.sh
