@@ -4,7 +4,11 @@ __pycache__/
 
 # 隐私 / 个人数据（含登录态 SESSDATA，切勿提交）
 config.json
-download_history.json
+
+# 下载历史数据库（SQLite，运行时自动生成）
+bili_history.db
+bili_history.db-wal
+bili_history.db-shm
 
 # 运行时产物
 logs/
