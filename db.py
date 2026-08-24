@@ -4,15 +4,14 @@ db.py - 多用户存储层（SQLite）
 用 Python 标准库 sqlite3 单文件数据库（bili_history.db）存储：
   - downloads : 每用户独立的下载历史（按 user 列隔离）
   - users     : 自建账号（用户名 + pbkdf2 密码哈希 + 盐 + 角色）
-  - user_config : 每用户独立配置（SESSDATA/画质/代理/监控列表等）
+
+  用户【设置/配置】（SESSDATA/画质/代理/下载目录/监控列表等）不再进 SQLite，
+  统一存放在同目录的 config.json 中，按 username 分键隔离：
+      {"default": {...}, "alice": {...}, "bob": {...}}
+  兼容旧版扁平 config.json（整份当作 default 用户）。
 
   对外接口与原单用户实现保持语义一致，server.py 调用方零改动（历史函数新增
   可选 user 参数，默认 "default" 以兼容未登录/全局兜底场景）。
-
-  表结构：
-  downloads(id, data_dyid, bvid, title, up_uid, up_name, time, created_at, user)
-  users(username PK, password_hash, salt, created_at, role)
-  user_config(username PK, config_json)
 
   角色：'admin'（可管理其他账号）/ 'user'（普通用户）。
   """
@@ -27,7 +26,7 @@ import sqlite3
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "bili_history.db")
-CONFIG_FILE = os.path.join(BASE_DIR, "config.json")   # 未登录/默认用户的配置兜底
+CONFIG_FILE = os.path.join(BASE_DIR, "config.json")   # 用户设置配置（按 username 分键：{default:{...}, 用户名:{...}}）
 
 _db_lock = threading.RLock()
 
@@ -81,12 +80,6 @@ def init_db():
                 )"""
             )
 
-            conn.execute(
-                """CREATE TABLE IF NOT EXISTS user_config (
-                    username    TEXT PRIMARY KEY,
-                    config_json TEXT NOT NULL
-                )"""
-            )
             # 列迁移（针对旧库：downloads 无 user 列 / users 无 role 列）必须在建索引前、
             # 且复用同一连接执行，否则旧库建 idx_user 会因 schema 缓存失败
             _ensure_user_column(conn)
@@ -96,6 +89,8 @@ def init_db():
             conn.execute("CREATE INDEX IF NOT EXISTS idx_uid ON downloads(up_uid)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_user ON downloads(user)")
             conn.commit()
+            # 一次性把遗留的 user_config 表迁到 config.json（之后设置不再进 SQLite）
+            _migrate_user_config_to_file()
         finally:
             conn.close()
 
@@ -321,59 +316,120 @@ def delete_user(username, delete_history=False):
         try:
             if delete_history:
                 conn.execute("DELETE FROM downloads WHERE user=?", (username,))
-            conn.execute("DELETE FROM user_config WHERE username=?", (username,))
             conn.execute("DELETE FROM users WHERE username=?", (username,))
             conn.commit()
         finally:
             conn.close()
+    # 同时清理该用户在 config.json 中的设置（文件侧，独立于 db 事务）
+    delete_user_config(username)
 
 
-# ----------------------- 用户配置（多用户 config）-----------------------
-def _load_global_config():
-    """读取全局 config.json（作为 default 用户兜底）。"""
+# ----------------------- 用户配置（仅 config.json，按用户分键）-----------------------
+_config_lock = threading.RLock()
+
+
+def _read_config_file():
     try:
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
+        return None
+
+
+def _write_config_file(data):
+    tmp = CONFIG_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, CONFIG_FILE)
+
+
+def _normalize_config_store(data):
+    """统一 config.json 为 {username: {settings}} 形式；兼容旧版扁平格式
+    （旧版整份就是一份配置，当作 default 用户）。"""
+    if not isinstance(data, dict):
         return {}
+    # 旧格式特征：顶层所有值都不是 dict（直接是 sessdata/qn 等字段）
+    if data and not any(isinstance(v, dict) for v in data.values()):
+        return {"default": data}
+    return data
 
 
 def load_user_config(username=DEFAULT_USER):
-    """读取某用户的配置；无记录时回落到全局 config.json（仅 default 用户）。"""
+    """读取某用户的配置（来自 config.json，按 username 分键）。无记录返回 {}。"""
     username = username or DEFAULT_USER
-    with _db_lock:
-        conn = _connect()
-        try:
-            r = conn.execute(
-                "SELECT config_json FROM user_config WHERE username=?", (username,)
-            ).fetchone()
-            if r:
-                try:
-                    return json.loads(r[0])
-                except Exception:
-                    pass
-        finally:
-            conn.close()
-    # 无独立配置：default 用户回落全局文件，其他用户返回空配置（首次使用）
-    if username == DEFAULT_USER:
-        return _load_global_config()
-    return {}
+    with _config_lock:
+        data = _normalize_config_store(_read_config_file())
+        cfg = data.get(username)
+        return dict(cfg) if isinstance(cfg, dict) else {}
 
 
 def save_user_config(username, cfg):
-    """保存（覆盖）某用户的配置。"""
+    """保存（覆盖）某用户的配置到 config.json。"""
     username = username or DEFAULT_USER
-    with _db_lock:
-        conn = _connect()
-        try:
-            conn.execute(
-                "INSERT INTO user_config(username, config_json) VALUES (?, ?) "
-                "ON CONFLICT(username) DO UPDATE SET config_json=excluded.config_json",
-                (username, json.dumps(cfg, ensure_ascii=False)),
-            )
-            conn.commit()
-        finally:
-            conn.close()
+    with _config_lock:
+        data = _normalize_config_store(_read_config_file())
+        data[username] = cfg
+        _write_config_file(data)
+
+
+def delete_user_config(username):
+    """删除某用户在 config.json 中的设置（default 不可删）。"""
+    username = username or DEFAULT_USER
+    if username == DEFAULT_USER:
+        return
+    with _config_lock:
+        data = _normalize_config_store(_read_config_file())
+        if username in data:
+            data.pop(username)
+            _write_config_file(data)
+
+
+def _migrate_user_config_to_file():
+    """一次性迁移：把遗留的 user_config 表内容写进 config.json 后删除该表，
+    确保『设置不再进 SQLite』。全新库无该表则直接跳过。"""
+    rows = None
+    try:
+        with _db_lock:
+            conn = _connect()
+            try:
+                rows = conn.execute(
+                    "SELECT username, config_json FROM user_config"
+                ).fetchall()
+            finally:
+                conn.close()
+    except Exception:
+        rows = None  # 表不存在等情况，视为无遗留数据
+
+    if rows:
+        with _config_lock:
+            data = _normalize_config_store(_read_config_file())
+            for uname, cj in rows:
+                try:
+                    cfg = json.loads(cj)
+                except Exception:
+                    cfg = None
+                if isinstance(cfg, dict) and cfg:
+                    data.setdefault(uname, cfg)
+            _write_config_file(data)
+
+    # 无论是否有数据，都卸下遗留的 user_config 表
+    try:
+        with _db_lock:
+            conn = _connect()
+            try:
+                conn.execute("DROP TABLE IF EXISTS user_config")
+                conn.commit()
+            finally:
+                conn.close()
+    except Exception:
+        pass
+
+    # 顺带把 config.json 统一规范化为『按用户分键』格式（兼容旧扁平）
+    with _config_lock:
+        raw = _read_config_file()
+        norm = _normalize_config_store(raw)
+        if raw != norm:
+            _write_config_file(norm)
 
 
 # ----------------------- 下载历史（按 user 隔离）-----------------------
