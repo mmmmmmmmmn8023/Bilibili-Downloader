@@ -1039,6 +1039,11 @@ class Handler(BaseHTTPRequestHandler):
         uid = params.get("uid", [""])[0]
         page = int(params.get("page", ["1"])[0])
         cookie = params.get("cookie", [""])[0]
+        # 前端最近一次已知的有效总数（深页受限时沿用，避免前端误判"到底"而回退）
+        try:
+            last_total = int(params.get("last_total", ["0"])[0])
+        except ValueError:
+            last_total = 0
 
         if not uid:
             self._json({"error": "缺少UID"})
@@ -1063,6 +1068,18 @@ class Handler(BaseHTTPRequestHandler):
                     source = "dynamic_fallback"
                 except Exception as e:
                     _logger.warning("视频列表降级到动态流失败 uid=%s page=%s: %s", uid, page, e)
+
+            # 深页受限/拉空保护：page>1 且接口返回空(无真实 total)时，
+            # 沿用前端传来的 last_total，并标记 has_more/partial，让前端保留当前页不回退。
+            partial = False
+            has_more = True
+            if page > 1 and total == 0 and not videos:
+                if last_total > 0:
+                    total = last_total
+                has_more = True       # 还有更多（本页失败不代表到底）
+                partial = True        # 本页数据不完整，前端应提示可重试
+                _logger.info("视频深页受限但沿用 last_total uid=%s page=%s last_total=%s", uid, page, last_total)
+
             # 标记已下载
             for v in videos:
                 v["downloaded"] = db.is_downloaded(
@@ -1075,6 +1092,8 @@ class Handler(BaseHTTPRequestHandler):
                 "limited": limited,
                 "fallback": source == "dynamic_fallback",
                 "page": page,
+                "has_more": has_more,
+                "partial": partial,
             })
         except Exception as e:
             self._json({"error": str(e)})

@@ -32,6 +32,9 @@ let currentUid = "";        // 当前搜索的UID
 let currentVideoPage = 1;   // 当前视频页码
 let videoPerPage = 12;      // 每页视频数（与「我的」页面一致，4 列 × 3 行）
 let videoTotal = 0;         // 视频总数
+// 已成功加载的视频页缓存：{page: videos[]}，命中缓存直接渲染、不重复请求；
+// 同时作为深页请求失败时的数据兜底，避免整页空白/回退到第1页。
+let videoPageCache = {};
 
 // 动态分页状态（每页10条，点下一页才向后拉一批，避免一次性狂拉触发B站风控）
 let currentDynPage = 1;     // 当前动态页码
@@ -163,6 +166,7 @@ async function searchByQuery(query) {
     currentUid = data.user && data.user.uid ? String(data.user.uid) : "";
     videoTotal = data.video_total || data.videos.length;
     currentVideoPage = 1;
+    videoPageCache = {};   // 新搜索重置视频页缓存，避免混入上一个UP主的数据
     // 动态分页状态初始化（首屏后端已拉好第1页）
     currentDynPage = 1;
     dynHasMore = !!data.dyn_has_more;
@@ -409,6 +413,70 @@ function rerenderCurrentTab() {
   updateSelectedCount();
 }
 
+// 只更新视频卡的「已下载」徽标，不重建 content DOM、不跳页、不打断翻页。
+// 供下载轮询(pollStatus)在视频 tab 下调用，替代整页 rerenderCurrentTab——
+// 后者会用滞后的 currentData.videos / currentVideoPage 重绘，把深页翻页打回旧页或吞掉重试提示。
+function refreshVideoDownloadedBadges() {
+  if (currentTab !== "videos") return;
+  document.querySelectorAll("#content .video-card").forEach((card) => {
+    const bvid = card.dataset.bvid;
+    if (!bvid || !isDownloadedCheck("0", bvid)) return;
+    const btn = card.querySelector(".btn-download");
+    if (btn && !btn.classList.contains("downloaded")) {
+      btn.classList.add("downloaded");
+      btn.disabled = true;
+      btn.textContent = "已下载";
+    }
+    const cb = card.querySelector(".item-checkbox");
+    if (cb) cb.remove();
+  });
+}
+
+// 只更新动态卡的「已下载」徽标，不重建 content DOM、不跳页、不打断翻页/筛选。
+// 供下载轮询在 dynamics tab 下调用，替代整页 rerenderCurrentTab（同视频卡耦合 BUG）。
+function refreshDynDownloadedBadges() {
+  if (currentTab !== "dynamics") return;
+  document.querySelectorAll("#content .dynamic-card").forEach((card) => {
+    const dyid = card.dataset.dyid;
+    const bvid = card.dataset.bvid;
+    if (!dyid && !bvid) return;
+    const done = isDownloadedCheck(dyid, bvid) || (bvid && isDownloadedCheck("0", bvid));
+    if (!done) return;
+    const dlBtn = card.querySelector(".btn-download");
+    if (dlBtn && !dlBtn.classList.contains("downloaded")) {
+      dlBtn.classList.add("downloaded");
+      dlBtn.disabled = true;
+      dlBtn.textContent = "已下载";
+      dlBtn.removeAttribute("onclick");
+    }
+    // 已下载：把复选框换成占位，保持布局对齐（与 renderDyn 一致）
+    const cb = card.querySelector(".item-checkbox");
+    if (cb) {
+      const ph = document.createElement("span");
+      ph.className = "item-checkbox-placeholder";
+      cb.replaceWith(ph);
+    }
+  });
+}
+
+// 只更新「我的」视图（稍后再看/收藏夹）视频卡的「已下载」徽标，不重建 selfContent DOM、不跳滚动。
+// 供下载轮询在 selfActive 下调用，替代 switchSelfTab 整视图重建（后者还可能误触发网络重拉）。
+function refreshSelfDownloadedBadges() {
+  const box = document.getElementById("selfContent");
+  if (!box) return;
+  box.querySelectorAll(".self-card").forEach((card) => {
+    const bvid = card.dataset.bvid;
+    if (!bvid || !isDownloadedCheck("0", bvid)) return;
+    const dlBtn = card.querySelector(".btn-download");
+    if (dlBtn && !dlBtn.classList.contains("downloaded")) {
+      dlBtn.classList.add("downloaded");
+      dlBtn.disabled = true;
+      dlBtn.textContent = "已下载";
+      dlBtn.removeAttribute("onclick");
+    }
+  });
+}
+
 function renderVideos(videos) {
   if (!videos || videos.length === 0) {
     // 区分「接口受限」与「真没有视频」：受限时提示去动态 Tab 或设置 Cookie
@@ -438,7 +506,7 @@ function renderVideos(videos) {
         ? ""
         : `<input type="checkbox" class="item-checkbox" data-bvid="${v.bvid}" ${selectedVideos.has(v.bvid) ? "checked" : ""} onchange="onVideoCheck('${v.bvid}', this.checked)">`;
       return `
-      <div class="card video-card">
+      <div class="card video-card" data-bvid="${v.bvid}">
         <div class="check-col">${checkbox}</div>
         <div class="vc-cover-wrap">
           <img class="thumb" src="${thumbUrl(v.cover, 320)}" alt="" loading="lazy"
@@ -659,7 +727,7 @@ function renderDynamics(dynamics) {
         ? `<button class="btn-pages" style="display:none" data-bvid="${d.bvid}" data-kind="d" data-key="${d.id}" onclick="openPagesModal('d','${d.id}','${d.bvid}')">分P</button>` : "";
 
       return `
-      <div class="card dynamic-card">
+      <div class="card dynamic-card" data-dyid="${d.id}" data-bvid="${d.bvid || ''}">
         <div class="dy-header-wrap"><div class="dy-header">
           ${checkbox}
           <span class="dy-type ${dyTypeCls}">${typeLabel}</span>
@@ -819,25 +887,55 @@ async function loadVideoPage(page) {
   const totalPages = Math.ceil(videoTotal / videoPerPage);
   if (page > totalPages) return;
 
-  // 显示加载中
   const content = document.getElementById("content");
+
+  // 1) 命中缓存：直接渲染，零网络请求（深页重复浏览/失败兜底都不回退）
+  if (videoPageCache[page] && videoPageCache[page].length) {
+    currentVideoPage = page;
+    currentData.videos = videoPageCache[page];
+    content.innerHTML = renderVideos(currentData.videos);
+    setupContentToggles(content);
+    updateSelectAllCheckbox();
+    return;
+  }
+
+  // 显示加载中
   content.innerHTML = `<div class="loading"><div class="spinner"></div>正在加载第 ${page} 页...</div>`;
 
   try {
-    const url = `/api/videos?uid=${encodeURIComponent(currentUid)}&page=${page}&cookie=${encodeURIComponent(cookie)}`;
+    // 带上最近一次已知有效总数，便于服务端在深页受限时沿用、避免前端误判到底
+    const url = `/api/videos?uid=${encodeURIComponent(currentUid)}&page=${page}&cookie=${encodeURIComponent(cookie)}&last_total=${videoTotal}`;
     const resp = await fetch(url);
     const data = await resp.json();
+
+    // 2) 失败/受限但非首页：保留当前页与列表，仅显示可重试提示，不覆盖数据、不置 videoTotal=0
+    //    判定条件：明确 error，或「本页无数据(partial/空 total)」——服务端深页受限会下发 partial=true
+    const isEmptyFail = (data.error || data.partial || (data.total === 0 && (!data.videos || data.videos.length === 0)));
+    if (isEmptyFail && page > 1) {
+      const msg = data.error
+        ? data.error
+        : "本页加载失败（可能是B站风控或网络超时），已为你保留当前页面。";
+      content.innerHTML = `
+        <div class="empty">
+          <div class="icon">⚠️</div>
+          <div>${escapeHtml(msg)}</div>
+          <button class="btn-pages" style="margin-top:12px" onclick="loadVideoPage(${page})">重试第 ${page} 页</button>
+        </div>`;
+      return;
+    }
     if (data.error) {
       content.innerHTML = `<div class="empty"><div class="icon">💥</div><div>${data.error}</div></div>`;
       return;
     }
-    // 更新当前页的视频列表（保留其他数据不变）
+
+    // 3) 正常：写入缓存 + 更新总数 + 渲染
     currentData.videos = data.videos;
+    videoPageCache[page] = data.videos;   // 缓存本页，供重试/重复浏览命中
     currentVideoPage = page;
     // 记录降级状态（视频列表接口受限时后端从动态流兜底）
     currentData.video_limited = data.limited || false;
     currentData.video_fallback = data.fallback || false;
-    if (data.total !== undefined) videoTotal = data.total;
+    if (data.total !== undefined && data.total > 0) videoTotal = data.total;  // 仅有效总数才更新
     // 标记已下载状态
     for (const v of data.videos) {
       v.downloaded = v.downloaded || isDownloadedCheck("0", v.bvid);
@@ -847,7 +945,13 @@ async function loadVideoPage(page) {
     // 更新全选框状态
     updateSelectAllCheckbox();
   } catch (e) {
-    content.innerHTML = `<div class="empty"><div class="icon">💥</div><div>加载失败: ${e.message}</div></div>`;
+    // 4) 网络异常：保留当前页，显示可重试提示（不回退）
+    content.innerHTML = `
+      <div class="empty">
+        <div class="icon">⚠️</div>
+        <div>加载失败: ${escapeHtml(e.message)}</div>
+        <button class="btn-pages" style="margin-top:12px" onclick="loadVideoPage(${page})">重试第 ${page} 页</button>
+      </div>`;
   }
 }
 
@@ -1486,12 +1590,6 @@ function kickStatusPoll() {
   if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
   schedulePoll();
 }
-function stopPolling() {
-  if (pollTimer) {
-    clearTimeout(pollTimer);
-    pollTimer = null;
-  }
-}
 
 async function pollStatus() {
   try {
@@ -1526,16 +1624,23 @@ async function pollStatus() {
         mapping.done = true;
         needRefresh = true;
       } else if (task.status === "error" && !mapping.done) {
-        // 下载失败，不标记为已下载
-        mapping.done = true;  // 标记为已处理（避免重复处理）
-        needRefresh = true;
+        // 下载失败，不标记为已下载；仅标记已处理避免重复，无需触发列表重绘
+        mapping.done = true;
       }
     }
     renderDownloadPanel();
     // 有任务状态变化时刷新列表（按当前所在视图：我的视图用 switchSelfTab，UP主视图用 switchTab）
     if (needRefresh) {
-      if (selfActive) switchSelfTab(selfStab);
-      else if (currentData) rerenderCurrentTab();
+      // 轮询只做「卡片级已下载徽标就地更新」，绝不整页重绘，避免干扰翻页/滚动/筛选。
+      // 各视图都有对应的局部刷新函数，替代原先的 rerenderCurrentTab / switchSelfTab（轮询耦合 BUG 统一修复）。
+      if (currentTab === "videos") {
+        refreshVideoDownloadedBadges();
+      } else if (currentTab === "dynamics") {
+        refreshDynDownloadedBadges();
+      } else if (selfActive) {
+        refreshSelfDownloadedBadges();
+      }
+      // history 等非列表视图无需刷新（本就不重绘）
     }
   } catch (e) {
     // 忽略网络错误
@@ -1654,7 +1759,10 @@ function renderDownloadPanel() {
       </div>`;
   }).join("");
 
-  // 全部结束 → 停止轮询，并在状态从"有进行中"转为"全结束"时弹一次提示
+  // 全部结束：弹一次完成提示，但**不要停止轮询**。
+  // 否则后端自动化下载（定时/立即检查）新下发的任务无法被前端感知，
+  // 永远显示不到面板。空闲态已由 IDLE_POLL_MS 低频兜底（见 schedulePoll），
+  // statusNeedsFast() 为 false 时每 10s 拉一次，足以感知自动化任务。
   const active = ids.filter((id) =>
     !["done", "error", "cancelled"].includes(downloadTasks[id].status)
   );
@@ -1662,7 +1770,7 @@ function renderDownloadPanel() {
     if (prevActiveCount > 0 && (ok + err + cancelled) > 0) {
       showToast(`下载完成 · 成功 ${ok} · 失败 ${err}` + (cancelled ? ` · 取消 ${cancelled}` : ""));
     }
-    setTimeout(stopPolling, 3000);
+    // 不再调用 stopPolling()，保持常驻轮询以接收自动化下发的任务
   }
   prevActiveCount = active.length;
 }
@@ -2144,6 +2252,16 @@ function openCookieModal() {
   document.getElementById("cookieInput").value = cookie;
   document.getElementById("cookieModal").classList.add("show");
 }
+// cookie 真正失效（expired）时自动弹出设置窗口；带去重，避免每 5 分钟复检反复打扰。
+// 仅处理 expired（登录态失效）；blocked/error 是风控或网络问题，重设 cookie 无效，不弹。
+function autoOpenCookieOnProblem() {
+  const modal = document.getElementById("cookieModal");
+  if (!modal) return;
+  if (modal.classList.contains("show")) return;        // 弹窗已开，不再重复
+  if (window.__cookieExpiredPrompted) return;           // 本会话已因失效弹过
+  openCookieModal();
+  window.__cookieExpiredPrompted = true;
+}
 function toggleCookieHelp() {
   const el = document.getElementById("cookieHelp");
   if (el) el.style.display = el.style.display === "none" ? "block" : "none";
@@ -2246,6 +2364,8 @@ async function verifyCookie() {
     if (d.login) {
       statusEl.dataset.state = "ok";
       txt.textContent = "✅ 已登录";
+      // cookie 重新有效后，重置"已因失效弹过窗"标记，允许下次过期再自动弹
+      window.__cookieExpiredPrompted = false;
       // 前端 cookie 为空但服务端配置有效时，同步过来（保证下载也用登录态）
       if (!cookie && d.has_sessdata) {
         cookie = d.sessdata;
@@ -2255,9 +2375,10 @@ async function verifyCookie() {
       statusEl.dataset.state = "empty";
       txt.textContent = "未设置Cookie";
     } else if (d.reason === "expired") {
-      // 真正登录态失效（cookie 存在但 B站返回未登录）
+      // 真正登录态失效（cookie 存在但 B站返回未登录）→ 自动弹出 Cookie 设置窗口
       statusEl.dataset.state = "warn";
       txt.textContent = "⚠ SESSDATA已过期，请重新设置";
+      autoOpenCookieOnProblem();
     } else if (d.reason === "blocked") {
       // 风控/网络受限，并非 cookie 过期 —— 不要误报"已过期"
       statusEl.dataset.state = "warn";
@@ -2742,7 +2863,7 @@ function selfVideoCard(v, favName = "") {
   const dl = v.bvid
     ? `<button class="btn-download${isDl ? " downloaded" : ""}" ${isDl ? "disabled" : ""} onclick="downloadVideo('${v.bvid}', '${escapeAttr(v.title)}', '${escapeAttr(v.owner_name || "未知UP主")}', false, null, '', '${selfStab}', '${escapeAttr(favName)}')">${isDl ? "已下载" : "下载"}</button>`
     : "";
-  return `<div class="self-card">
+  return `<div class="self-card" data-bvid="${v.bvid || ''}">
     ${cover}
     <div class="sc-body">
       <div class="sc-title">${escapeHtml(v.title)}</div>
