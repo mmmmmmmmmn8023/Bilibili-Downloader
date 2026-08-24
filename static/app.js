@@ -2879,14 +2879,17 @@ boot();
 
 // ==================== 多用户账号（自建登录/注册/登出）====================
 let currentUser = null;
+let isAdmin = false;
 
 async function boot() {
   try {
     const resp = await fetch("/api/me");
     const d = await resp.json();
     currentUser = d.user || null;
+    isAdmin = !!(d && d.is_admin);
   } catch (e) {
     currentUser = null;
+    isAdmin = false;
   }
   updateUserHeader();
   if (currentUser) {
@@ -2921,6 +2924,7 @@ async function submitAuth() {
     if (d.error) { if (errEl) errEl.textContent = d.error || "操作失败"; return; }
     // 成功：重置跨用户数据后重新初始化主界面
     currentUser = d.user;
+    isAdmin = !!(d && d.is_admin);
     downloadedItems = new Set();
     cookie = "";
     try { localStorage.removeItem("bilibili_sessdata"); } catch (e) {}
@@ -2938,6 +2942,7 @@ async function logout() {
     await fetch("/api/logout", { method: "POST", headers: { "Content-Type": "application/json" } });
   } catch (e) {}
   currentUser = null;
+  isAdmin = false;
   downloadedItems = new Set();
   cookie = "";
   try { localStorage.removeItem("bilibili_sessdata"); } catch (e) {}
@@ -2949,6 +2954,7 @@ async function logout() {
 function updateUserHeader() {
   const header = document.getElementById("userHeader");
   const logoutItem = document.getElementById("logoutItem");
+  const adminBtn = document.getElementById("adminBtn");
   if (currentUser) {
     if (header) header.textContent = "👤 " + currentUser;
     if (logoutItem) logoutItem.style.display = "";
@@ -2956,4 +2962,111 @@ function updateUserHeader() {
     if (header) header.textContent = "未登录";
     if (logoutItem) logoutItem.style.display = "none";
   }
+  if (adminBtn) adminBtn.style.display = (currentUser && isAdmin) ? "" : "none";
+}
+
+// ==================== 管理员：用户管理面板 ====================
+function fmtTime(ts) {
+  if (!ts) return "-";
+  try { return new Date(ts * 1000).toLocaleString("zh-CN"); } catch (e) { return "-"; }
+}
+
+function openAdminPanel() {
+  if (!isAdmin) return;
+  document.getElementById("adminModal").classList.remove("hidden");
+  document.getElementById("adminModal").classList.add("show");
+  document.getElementById("adminMsg").textContent = "";
+  loadAdminUsers();
+}
+
+function closeAdminPanel() {
+  document.getElementById("adminModal").classList.remove("show");
+  document.getElementById("adminModal").classList.add("hidden");
+}
+
+async function adminPost(url, body) {
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body || {}),
+  });
+  return resp.json();
+}
+
+async function loadAdminUsers() {
+  try {
+    const resp = await fetch("/api/admin/users");
+    const d = await resp.json();
+    if (d.error) { document.getElementById("adminMsg").textContent = d.error; return; }
+    renderAdminUsers(d.users || []);
+  } catch (e) {
+    document.getElementById("adminMsg").textContent = "加载失败，请重试";
+  }
+}
+
+function renderAdminUsers(users) {
+  const box = document.getElementById("adminUserList");
+  box.innerHTML = "";
+  users.forEach((u) => {
+    const isSelf = u.username === currentUser;
+    const isAdm = u.role === "admin";
+    const row = document.createElement("div");
+    row.className = "admin-row";
+    row.innerHTML = `
+      <span class="u-name">${u.username}${isSelf ? "（当前）" : ""}</span>
+      <span class="role-badge ${isAdm ? "admin" : "user"}">${isAdm ? "管理员" : "普通用户"}</span>
+      <span class="u-meta">注册：${fmtTime(u.created_at)}</span>
+      <span class="u-meta">下载：${u.download_count} 条</span>
+      <span class="spacer"></span>
+      <button class="btn-text" data-act="role">${isAdm ? "取消管理员" : "设为管理员"}</button>
+      <button class="btn-text" data-act="reset">重置密码</button>
+      <button class="btn-text ${isSelf ? "" : "danger"}" data-act="del" ${isSelf ? "disabled style='opacity:.4;cursor:default'" : ""}>删除</button>
+    `;
+    row.querySelector('[data-act="role"]').onclick = () => adminSetRole(u.username, isAdm ? "user" : "admin");
+    row.querySelector('[data-act="reset"]').onclick = () => {
+      const np = prompt(`为「${u.username}」设置新密码：`);
+      if (np == null || np === "") return;
+      adminResetPassword(u.username, np);
+    };
+    const delBtn = row.querySelector('[data-act="del"]');
+    if (!isSelf) delBtn.onclick = () => adminDeleteUser(u.username, u.download_count);
+    box.appendChild(row);
+  });
+}
+
+async function adminCreateUser() {
+  const username = (document.getElementById("adminNewUser").value || "").trim();
+  const password = document.getElementById("adminNewPass").value || "";
+  const role = document.getElementById("adminNewRole").value || "user";
+  const msg = document.getElementById("adminMsg");
+  if (!username || !password) { msg.textContent = "用户名和密码均不能为空"; return; }
+  const d = await adminPost("/api/admin/users/create", { username, password, role });
+  if (d.error) { msg.textContent = d.error; return; }
+  msg.textContent = "已创建：" + username;
+  document.getElementById("adminNewUser").value = "";
+  document.getElementById("adminNewPass").value = "";
+  loadAdminUsers();
+}
+
+async function adminResetPassword(username, newPassword) {
+  const d = await adminPost("/api/admin/reset_password", { username, new_password: newPassword });
+  const msg = document.getElementById("adminMsg");
+  msg.textContent = d.error ? d.error : `已重置「${username}」的密码`;
+  if (!d.error) loadAdminUsers();
+}
+
+async function adminSetRole(username, role) {
+  const d = await adminPost("/api/admin/set_role", { username, role });
+  const msg = document.getElementById("adminMsg");
+  msg.textContent = d.error ? d.error : `已将「${username}」设为${role === "admin" ? "管理员" : "普通用户"}`;
+  if (!d.error) loadAdminUsers();
+}
+
+async function adminDeleteUser(username, downloadCount) {
+  if (!confirm(`确定删除用户「${username}」？该操作不可恢复。`)) return;
+  const delHist = confirm(`是否同时删除「${username}」的下载历史（${downloadCount || 0} 条）？\n确定=删除历史，取消=仅删除账号（保留历史记录）`);
+  const d = await adminPost("/api/admin/delete_user", { username, delete_history: delHist });
+  const msg = document.getElementById("adminMsg");
+  msg.textContent = d.error ? d.error : `已删除「${username}」`;
+  if (!d.error) loadAdminUsers();
 }

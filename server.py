@@ -44,7 +44,6 @@ PORT = 8000
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
 DOWNLOAD_DIR = os.path.join(BASE_DIR, "downloads")
-CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
 LOGS_DIR = os.path.join(BASE_DIR, "logs")
 
 # ========================================================
@@ -826,6 +825,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._serve_static(path[8:])
             elif path == "/api/me":
                 self._api_me()
+            elif path == "/api/admin/users":
+                self._api_admin_list_users()
             elif path == "/api/search":
                 self._api_search(params)
             elif path == "/api/videos":
@@ -880,6 +881,14 @@ class Handler(BaseHTTPRequestHandler):
                 self._api_login(data)
             elif path == "/api/logout":
                 self._api_logout(data)
+            elif path == "/api/admin/users/create":
+                self._api_admin_create_user(data)
+            elif path == "/api/admin/reset_password":
+                self._api_admin_reset_password(data)
+            elif path == "/api/admin/set_role":
+                self._api_admin_set_role(data)
+            elif path == "/api/admin/delete_user":
+                self._api_admin_delete_user(data)
             elif path == "/api/config":
                 self._api_save_config(data)
             elif path == "/api/check_cookie":
@@ -1742,7 +1751,7 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": str(e)})
             return
         sid = _new_session(username)
-        self._json({"ok": True, "user": username},
+        self._json({"ok": True, "user": username, "is_admin": db.is_admin(username)},
                     extra_headers=[("Set-Cookie", self._session_cookie(sid))])
 
     def _api_login(self, data):
@@ -1753,7 +1762,7 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": "用户名或密码错误"})
             return
         sid = _new_session(username)
-        self._json({"ok": True, "user": username},
+        self._json({"ok": True, "user": username, "is_admin": db.is_admin(username)},
                     extra_headers=[("Set-Cookie", self._session_cookie(sid))])
 
     def _api_logout(self, data):
@@ -1763,7 +1772,73 @@ class Handler(BaseHTTPRequestHandler):
 
     def _api_me(self):
         self._json({"user": self.current_user or None,
-                    "default": self.current_user is None})
+                    "default": self.current_user is None,
+                    "is_admin": bool(self.current_user and db.is_admin(self.current_user))})
+
+    # ---- 管理员后台 ----
+    def _require_admin(self):
+        """校验当前会话为管理员；非管理员时直接回写错误并返回 False。"""
+        if not self.current_user:
+            self._json({"error": "未登录"}, 401)
+            return False
+        if not db.is_admin(self.current_user):
+            self._json({"error": "需要管理员权限"}, 403)
+            return False
+        return True
+
+    def _api_admin_list_users(self):
+        if not self._require_admin():
+            return
+        self._json({"users": db.list_users()})
+
+    def _api_admin_create_user(self, data):
+        if not self._require_admin():
+            return
+        username = (data.get("username") or "").strip()
+        password = data.get("password") or ""
+        role = data.get("role") or "user"
+        try:
+            db.create_user(username, password, role)
+        except ValueError as e:
+            self._json({"error": str(e)})
+            return
+        self._json({"ok": True, "user": username})
+
+    def _api_admin_reset_password(self, data):
+        if not self._require_admin():
+            return
+        username = (data.get("username") or "").strip()
+        new_pw = data.get("new_password") or ""
+        try:
+            db.reset_user_password(username, new_pw)
+        except ValueError as e:
+            self._json({"error": str(e)})
+            return
+        self._json({"ok": True})
+
+    def _api_admin_set_role(self, data):
+        if not self._require_admin():
+            return
+        username = (data.get("username") or "").strip()
+        role = data.get("role") or "user"
+        try:
+            db.set_user_role(username, role)
+        except ValueError as e:
+            self._json({"error": str(e)})
+            return
+        self._json({"ok": True})
+
+    def _api_admin_delete_user(self, data):
+        if not self._require_admin():
+            return
+        username = (data.get("username") or "").strip()
+        delete_history = bool(data.get("delete_history"))
+        try:
+            db.delete_user(username, delete_history)
+        except ValueError as e:
+            self._json({"error": str(e)})
+            return
+        self._json({"ok": True})
 
     def _api_check_cookie(self, src):
         """验证 SESSDATA 是否有效，返回登录状态（供前端显示 + 下载前预检）"""
@@ -1952,6 +2027,13 @@ def main():
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
     # 初始化下载历史数据库（SQLite），首次运行自动建表
     db.init_db()
+    # 启动引导：若 .env 配置了 ADMIN_USER / ADMIN_PASSWORD，确保该管理员账号存在
+    # 且密码/角色以 .env 为准（忘记密码时改 .env 重启即可重置）
+    _admin_user = os.environ.get("ADMIN_USER", "").strip()
+    _admin_pass = os.environ.get("ADMIN_PASSWORD", "").strip()
+    if _admin_user and _admin_pass:
+        db.ensure_admin_user(_admin_user, _admin_pass)
+        print(f"  管理员账号已就绪: {_admin_user}")
     # 根据配置初始化 TLS 校验开关（默认 insecure_tls=true → 不校验，兼容代理/抓包）
     bilibili.VERIFY_SSL = not load_config().get("insecure_tls", True)
     # 监听地址：优先用环境变量 BIND_HOST（compose 中设为 0.0.0.0，供同网络 Caddy 反代）；

@@ -1,4 +1,4 @@
-# 本文件由 deploy.sh 从模板生成（替换 __DOMAIN__ / __AUTH_USER__ / __HASH__ / __ADMIN_EMAIL__）
+# 本文件由 deploy.sh 从模板生成（替换 __DOMAIN__ / __ADMIN_EMAIL__）
 # 如需使用自有证书，请参考 DEPLOY.md 的 FAQ 修改此处
 
 {

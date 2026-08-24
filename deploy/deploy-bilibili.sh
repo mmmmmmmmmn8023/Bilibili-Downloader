@@ -30,7 +30,7 @@ else
   cd "$DIR"
   # 部署目录无需保留本地提交/改动，直接对齐远端（fetch + reset --hard）：
   # 若远端历史被 force push 改写，git pull --ff-only 会因分支分叉而失败，reset 可避免；
-  # 运行期文件（config.json / download_history.json / downloads / logs）均未跟踪，不受影响
+  # 运行期文件（config.json / downloads / logs）均未跟踪，不受影响
   git fetch origin "$BRANCH"
   git reset --hard "origin/$BRANCH"
 fi
@@ -40,7 +40,7 @@ cd "$DIR"
 # 确保挂载所需的运行时文件/目录存在（否则 Docker 会把文件建成目录导致写入失败）
 # ⚠️ bili_history.db 也必须 touch：它是 SQLite 单文件库，若主机不存在，Docker 会建成一个
 #    目录，sqlite3 打开失败 → server 启动即崩溃（容器 unhealthy）。这是持久化卷新增后漏的一项。
-for f in config.json download_history.json bili_history.db; do
+for f in config.json bili_history.db; do
   # 若上一轮部署已误建为目录：先抢救目录里可能藏着的同名真实文件
   # （例如用户曾把自己的 bili_history.db 复制到服务器，却被 Docker 建成的目录“吞”进去，
   #   真实库落在 ./bili_history.db/bili_history.db）。不抢救直接 rm 会丢历史，故先挪到 /tmp。
@@ -50,14 +50,14 @@ for f in config.json download_history.json bili_history.db; do
   fi
   touch "$f"
 done
-# 若上面抢救出了真实库（仅 bili_history.db 有意义），覆盖刚建的空文件；config/download_history 等可丢弃
+# 若上面抢救出了真实库（仅 bili_history.db 有意义），覆盖刚建的空文件；config 等可丢弃
 if [ -f "/tmp/bili_history.db.rescued" ]; then
   cp "/tmp/bili_history.db.rescued" bili_history.db
 fi
 mkdir -p downloads logs
 
 # 关键：调用仓库自带的 deploy.sh
-#   deploy.sh 会：读 .env → 生成 Basic Auth 哈希 → 渲染 Caddyfile → up -d --build（本地构建 app 镜像）→ 健康检查
+#   deploy.sh 会：读 .env → 渲染 Caddyfile → up -d --build（本地构建 app 镜像）→ 健康检查
 #   ⚠️ 不要改成直接 `docker compose up -d`（不带 --build），否则 Caddyfile 不会生成，Caddy 启动失败
 if [ -f "./deploy.sh" ]; then
   chmod +x deploy.sh

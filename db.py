@@ -3,17 +3,19 @@ db.py - 多用户存储层（SQLite）
 ================================
 用 Python 标准库 sqlite3 单文件数据库（bili_history.db）存储：
   - downloads : 每用户独立的下载历史（按 user 列隔离）
-  - users     : 自建账号（用户名 + pbkdf2 密码哈希 + 盐）
+  - users     : 自建账号（用户名 + pbkdf2 密码哈希 + 盐 + 角色）
   - user_config : 每用户独立配置（SESSDATA/画质/代理/监控列表等）
 
-对外接口与原单用户实现保持语义一致，server.py 调用方零改动（历史函数新增
-可选 user 参数，默认 "default" 以兼容未登录/全局兜底场景）。
+  对外接口与原单用户实现保持语义一致，server.py 调用方零改动（历史函数新增
+  可选 user 参数，默认 "default" 以兼容未登录/全局兜底场景）。
 
-表结构：
-    downloads(id, data_dyid, bvid, title, up_uid, up_name, time, created_at, user)
-    users(username PK, password_hash, salt, created_at)
-    user_config(username PK, config_json)
-"""
+  表结构：
+  downloads(id, data_dyid, bvid, title, up_uid, up_name, time, created_at, user)
+  users(username PK, password_hash, salt, created_at, role)
+  user_config(username PK, config_json)
+
+  角色：'admin'（可管理其他账号）/ 'user'（普通用户）。
+  """
 
 import os
 import json
@@ -21,6 +23,7 @@ import time
 import hashlib
 import hmac
 import threading
+import sqlite3
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "bili_history.db")
@@ -68,17 +71,13 @@ def init_db():
                     user      TEXT NOT NULL DEFAULT 'default'
                 )"""
             )
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_dyid ON downloads(data_dyid)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_bvid ON downloads(bvid)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_uid ON downloads(up_uid)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_user ON downloads(user)")
-
             conn.execute(
                 """CREATE TABLE IF NOT EXISTS users (
                     username      TEXT PRIMARY KEY,
                     password_hash TEXT NOT NULL,
                     salt          TEXT NOT NULL,
-                    created_at    REAL NOT NULL
+                    created_at    REAL NOT NULL,
+                    role          TEXT NOT NULL DEFAULT 'user'
                 )"""
             )
 
@@ -88,25 +87,69 @@ def init_db():
                     config_json TEXT NOT NULL
                 )"""
             )
+            # 列迁移（针对旧库：downloads 无 user 列 / users 无 role 列）必须在建索引前、
+            # 且复用同一连接执行，否则旧库建 idx_user 会因 schema 缓存失败
+            _ensure_user_column(conn)
+            _ensure_role_column(conn)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_dyid ON downloads(data_dyid)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_bvid ON downloads(bvid)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_uid ON downloads(up_uid)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_user ON downloads(user)")
             conn.commit()
         finally:
             conn.close()
-    # 旧数据（无 user 列时）迁移：为已有下载历史补齐 user 维度
-    _ensure_user_column()
 
 
-def _ensure_user_column():
-    """兼容旧库：downloads 表若无 user 列则补齐并回填 default。"""
+def _ensure_user_column(conn=None):
+    """兼容旧库：downloads 表若无 user 列则补齐并回填 default。
+    传入 conn 时直接在该连接上迁移（用于 init_db 内、建索引前）。"""
+    if conn is not None:
+        _migrate_user_column(conn)
+        return
     with _db_lock:
-        conn = _connect()
+        c = _connect()
         try:
-            cols = [r[1] for r in conn.execute("PRAGMA table_info(downloads)")]
-            if "user" not in cols:
-                conn.execute("ALTER TABLE downloads ADD COLUMN user TEXT DEFAULT 'default'")
-                conn.execute("UPDATE downloads SET user='default' WHERE user IS NULL OR user=''")
-                conn.commit()
+            _migrate_user_column(c)
         finally:
-            conn.close()
+            c.close()
+
+
+def _migrate_user_column(conn):
+    tables = [r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='downloads'")]
+    if "downloads" not in tables:
+        return
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(downloads)")]
+    if "user" not in cols:
+        conn.execute("ALTER TABLE downloads ADD COLUMN user TEXT DEFAULT 'default'")
+        conn.execute("UPDATE downloads SET user='default' WHERE user IS NULL OR user=''")
+        conn.commit()
+
+
+def _ensure_role_column(conn=None):
+    """兼容旧库：users 表若无 role 列则补齐并回填 'user'。
+    传入 conn 时直接在该连接上迁移（用于 init_db 内、建索引前）。"""
+    if conn is not None:
+        _migrate_role_column(conn)
+        return
+    with _db_lock:
+        c = _connect()
+        try:
+            _migrate_role_column(c)
+        finally:
+            c.close()
+
+
+def _migrate_role_column(conn):
+    tables = [r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='users'")]
+    if "users" not in tables:
+        return
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(users)")]
+    if "role" not in cols:
+        conn.execute("ALTER TABLE users ADD COLUMN role TEXT DEFAULT 'user'")
+        conn.execute("UPDATE users SET role='user' WHERE role IS NULL OR role=''")
+        conn.commit()
 
 
 # ----------------------- 密码哈希 -----------------------
@@ -123,10 +166,12 @@ def verify_password(pw, salt, stored_hash):
 
 
 # ----------------------- 用户管理 -----------------------
-def create_user(username, pw):
-    """创建用户；用户名已存在抛 ValueError。"""
+def create_user(username, pw, role="user"):
+    """创建用户；用户名已存在抛 ValueError。role 默认 'user'，可为 'admin'。"""
     if not username or not pw:
         raise ValueError("用户名与密码均不能为空")
+    if role not in ("user", "admin"):
+        raise ValueError("非法角色")
     if user_exists(username):
         raise ValueError("用户名已存在")
     h, s = hash_password(pw)
@@ -134,8 +179,9 @@ def create_user(username, pw):
         conn = _connect()
         try:
             conn.execute(
-                "INSERT INTO users(username, password_hash, salt, created_at) VALUES (?,?,?,?)",
-                (username, h, s, time.time()),
+                "INSERT INTO users(username, password_hash, salt, created_at, role) "
+                "VALUES (?,?,?,?,?)",
+                (username, h, s, time.time(), role),
             )
             conn.commit()
         finally:
@@ -143,20 +189,143 @@ def create_user(username, pw):
 
 
 def get_user(username):
-    """返回 {password_hash, salt} 或 None。"""
+    """返回 {password_hash, salt, role} 或 None。"""
     with _db_lock:
         conn = _connect()
         try:
             r = conn.execute(
-                "SELECT password_hash, salt FROM users WHERE username=?", (username,)
+                "SELECT password_hash, salt, role FROM users WHERE username=?", (username,)
             ).fetchone()
-            return {"password_hash": r[0], "salt": r[1]} if r else None
+            return {"password_hash": r[0], "salt": r[1], "role": r[2] or "user"} if r else None
         finally:
             conn.close()
 
 
 def user_exists(username):
     return get_user(username) is not None
+
+
+def get_user_role(username):
+    """返回 'admin' / 'user' / None。"""
+    rec = get_user(username)
+    return rec["role"] if rec else None
+
+
+def is_admin(username):
+    return get_user_role(username) == "admin"
+
+
+def set_user_role(username, role):
+    """设置用户角色（'user' / 'admin'）。"""
+    if role not in ("user", "admin"):
+        raise ValueError("非法角色")
+    if not user_exists(username):
+        raise ValueError("用户不存在")
+    with _db_lock:
+        conn = _connect()
+        try:
+            conn.execute("UPDATE users SET role=? WHERE username=?", (role, username))
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def ensure_admin_user(username, pw):
+    """确保管理员账号存在且密码/角色正确（供启动引导使用）。
+    若账号不存在则创建为 admin；若存在则同步密码与角色（使 .env 中的
+    ADMIN_PASSWORD 始终为权威值，忘记密码时可重置）。"""
+    if not username or not pw:
+        return
+    role = "admin"
+    h, s = hash_password(pw)
+    with _db_lock:
+        conn = _connect()
+        try:
+            if user_exists(username):
+                conn.execute(
+                    "UPDATE users SET password_hash=?, salt=?, role=? WHERE username=?",
+                    (h, s, role, username),
+                )
+            else:
+                conn.execute(
+                    "INSERT INTO users(username, password_hash, salt, created_at, role) "
+                    "VALUES (?,?,?,?,?)",
+                    (username, h, s, time.time(), role),
+                )
+            conn.execute(
+                "UPDATE users SET role='admin' WHERE username=?", (username,)
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def reset_user_password(username, new_pw):
+    """管理员代重置某用户密码。"""
+    if not new_pw:
+        raise ValueError("新密码不能为空")
+    if not user_exists(username):
+        raise ValueError("用户不存在")
+    h, s = hash_password(new_pw)
+    with _db_lock:
+        conn = _connect()
+        try:
+            conn.execute(
+                "UPDATE users SET password_hash=?, salt=? WHERE username=?",
+                (h, s, username),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def list_users():
+    """返回全部用户列表（含角色、注册时间、下载数），按注册时间升序。"""
+    with _db_lock:
+        conn = _connect()
+        try:
+            rows = conn.execute(
+                "SELECT username, role, created_at FROM users ORDER BY created_at ASC"
+            ).fetchall()
+        finally:
+            conn.close()
+    result = []
+    for username, role, created_at in rows:
+        result.append({
+            "username": username,
+            "role": role or "user",
+            "created_at": created_at,
+            "download_count": count_user_downloads(username),
+        })
+    return result
+
+
+def count_user_downloads(username):
+    with _db_lock:
+        conn = _connect()
+        try:
+            r = conn.execute(
+                "SELECT COUNT(*) FROM downloads WHERE user=?", (username,)
+            ).fetchone()
+            return r[0] if r else 0
+        finally:
+            conn.close()
+
+
+def delete_user(username, delete_history=False):
+    """删除账号（含其独立配置）；delete_history=True 时连带删除其下载历史。"""
+    if not user_exists(username):
+        raise ValueError("用户不存在")
+    with _db_lock:
+        conn = _connect()
+        try:
+            if delete_history:
+                conn.execute("DELETE FROM downloads WHERE user=?", (username,))
+            conn.execute("DELETE FROM user_config WHERE username=?", (username,))
+            conn.execute("DELETE FROM users WHERE username=?", (username,))
+            conn.commit()
+        finally:
+            conn.close()
 
 
 # ----------------------- 用户配置（多用户 config）-----------------------

@@ -1194,6 +1194,23 @@
     }
     .btn-text:hover { text-decoration: underline; }
 
+    /* ===== 管理员用户管理面板 ===== */
+    .admin-toolbar { display: flex; align-items: center; gap: 8px; margin-bottom: 14px; flex-wrap: wrap; }
+    .admin-msg { font-size: 12px; color: #e06c9f; margin-left: 4px; }
+    .admin-list { display: flex; flex-direction: column; gap: 8px; }
+    .admin-row {
+      display: flex; align-items: center; gap: 10px; padding: 10px 12px;
+      background: rgba(255,255,255,.04); border: 1px solid rgba(255,255,255,.08);
+      border-radius: 8px; flex-wrap: wrap;
+    }
+    .admin-row .u-name { font-weight: 600; min-width: 120px; }
+    .admin-row .u-meta { font-size: 12px; color: #9aa4b2; }
+    .admin-row .spacer { flex: 1; }
+    .role-badge { font-size: 11px; padding: 2px 8px; border-radius: 10px; }
+    .role-badge.admin { background: #fb7299; color: #fff; }
+    .role-badge.user { background: #2b3340; color: #9aa4b2; }
+    .admin-row .btn-text.danger { color: #ff6b6b; }
+
     /* ===== 自动化下载弹窗布局优化 ===== */
     .auto-modal { width: 560px; max-height: 92vh; overflow: hidden; display: flex; flex-direction: column; }
     .auto-modal-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 2px; flex-shrink: 0; }
@@ -1691,6 +1708,7 @@
       <span id="autoFloatDot"></span>
       <span id="autoFloatText">自动下载中</span>
     </div>
+    <button class="navbar-btn hidden" id="adminBtn" onclick="openAdminPanel()">管理</button>
     <div class="nav-settings" id="navSettings">
       <button class="nav-settings-btn" onclick="toggleNavSettings(event)" title="设置">⚙</button>
       <div class="nav-settings-menu hidden" id="navSettingsMenu">
@@ -2073,6 +2091,29 @@
       <a href="mailto:mmmmmmmmmn8023@qq.com">联系邮箱</a>
     </div>
   </footer>
+
+  <!-- 管理员：用户管理面板 -->
+  <div class="modal-overlay hidden" id="adminModal">
+    <div class="permission-modal" style="width:min(760px,94vw);max-height:90vh;display:flex;flex-direction:column;">
+      <div class="permission-header">
+        <span>用户管理（管理员）</span>
+        <button class="modal-close" onclick="closeAdminPanel()">×</button>
+      </div>
+      <div class="permission-body" style="overflow:auto;">
+        <div class="admin-toolbar">
+          <input id="adminNewUser" class="input" placeholder="新用户名" style="width:160px" />
+          <input id="adminNewPass" class="input" placeholder="密码" style="width:140px" type="text" />
+          <select id="adminNewRole" class="input" style="width:110px">
+            <option value="user">普通用户</option>
+            <option value="admin">管理员</option>
+          </select>
+          <button class="btn-primary" onclick="adminCreateUser()">新建账号</button>
+          <span id="adminMsg" class="admin-msg"></span>
+        </div>
+        <div id="adminUserList" class="admin-list"></div>
+      </div>
+    </div>
+  </div>
 
   <!-- 账号登录 / 注册 覆盖层（自建多用户体系入口） -->
   <div class="modal-overlay show" id="loginOverlay">

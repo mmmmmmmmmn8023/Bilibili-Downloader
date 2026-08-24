@@ -34,7 +34,7 @@ set +a
 : "${ADMIN_EMAIL:?请在 .env 中设置 ADMIN_EMAIL}"
 
 # 确保被挂载的运行时文件存在（否则 Docker 会建成目录，导致应用写入失败）
-touch config.json download_history.json 2>/dev/null || true
+touch config.json 2>/dev/null || true
 
 echo "==> [3/7] 预检 80 / 443 端口是否被占用"
 for port in 80 443; do

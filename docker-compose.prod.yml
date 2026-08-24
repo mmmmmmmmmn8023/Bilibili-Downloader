@@ -1,8 +1,8 @@
 # 生产部署编排（公网 + 域名 + 鉴权）
-# 拓扑：浏览器 → Caddy(443 + Basic Auth) → app(仅内部 8000) → 持久化卷
+# 拓扑：浏览器 → Caddy(443 HTTPS 反代) → app(仅内部 8000, 应用内账号鉴权) → 持久化卷
 #
 # 用法：
-#   1. cp .env.example .env        # 填 DOMAIN / AUTH_USER / AUTH_PASS / ADMIN_EMAIL
+#   1. cp .env.example .env        # 填 DOMAIN / ADMIN_EMAIL（可选 ADMIN_USER / ADMIN_PASSWORD 指定管理员）
 #   2. chmod +x deploy.sh && ./deploy.sh
 #
 # 说明：
@@ -24,13 +24,15 @@ services:
       - PORT=8000
       # 必须监听所有网卡，否则同网络内 Caddy 反代 app:8000 会 connection refused
       - BIND_HOST=0.0.0.0
+      # 管理员账号引导（来自 .env；留空则不自动创建管理员）
+      - ADMIN_USER=${ADMIN_USER}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD}
     # 仅内部暴露，绝不映射公网端口
     expose:
       - "8000"
     volumes:
       - ./downloads:/app/downloads
       - ./config.json:/app/config.json
-      - ./download_history.json:/app/download_history.json
       - ./bili_history.db:/app/bili_history.db
       - ./logs:/app/logs
     # 健康检查：TCP 探测 8000，确认服务已监听再放行流量

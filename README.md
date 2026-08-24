@@ -4,7 +4,7 @@ B站 视频 / 动态下载工具。搜索 UP主即可批量下载投稿视频与
 
 ![License](https://img.shields.io/badge/license-Apache%202.0-blue) ![Python](https://img.shields.io/badge/python-3.13%2B-blue) ![Platform](https://img.shields.io/badge/platform-Linux%20%2F%20Windows-lightgrey)
 
-> **本分支（`develop/feature`）定位为服务器部署版本**：通过 Docker + Caddy 反向代理对外提供 HTTPS 服务，并启用 Basic Auth 鉴权。应用本身 `server.py` 仅监听容器内部 `8000`，不直接暴露公网。
+> **本分支（`develop/feature`）定位为服务器部署版本**：通过 Docker + Caddy 反向代理对外提供 HTTPS 服务，应用内置自建账号体系（网页注册/登录）负责鉴权。`server.py` 仅监听容器内部 `8000`，不直接暴露公网。
 
 ---
 
@@ -41,7 +41,7 @@ B站 视频 / 动态下载工具。搜索 UP主即可批量下载投稿视频与
 
 ```
             ┌─────────────┐
-  浏览器 ──▶ │   Caddy     │  :443  HTTPS + Basic Auth
+  浏览器 ──▶ │   Caddy     │  :443  HTTPS（仅反代，鉴权由应用内账号体系负责）
             │ (反代/证书)  │
             └──────┬──────┘
                    │ 内部网络
@@ -51,7 +51,7 @@ B站 视频 / 动态下载工具。搜索 UP主即可批量下载投稿视频与
             └─────────────┘
 ```
 
-- **公网入口**：Caddy（80 仅用于申请/续期证书，443 为 HTTPS 入口 + Basic Auth 唯一鉴权防线）
+- **公网入口**：Caddy（80 仅用于申请/续期证书，443 为 HTTPS 入口；公网鉴权由应用内自建账号体系负责，Caddy 仅做反代）
 - **应用**：`docker-compose.prod.yml` 中以 `expose 8000` 仅内部暴露，绝不映射公网端口
 - **HTTPS 证书**：由 Caddy 自动申请（ACME）并存储于 `caddy_data` 卷
 
@@ -65,12 +65,12 @@ B站 视频 / 动态下载工具。搜索 UP主即可批量下载投稿视频与
 
 ```bash
 # 1. 准备配置
-cp .env.example .env          # 填写 DOMAIN / AUTH_USER / AUTH_PASS / ADMIN_EMAIL
+cp .env.example .env          # 填写 DOMAIN / ADMIN_EMAIL
 
 # 2. 一键部署（生成 Caddyfile + 构建镜像 + 启动 + 健康检查）
 ./deploy.sh
 
-# 3. 浏览器访问 https://你的域名，输入 Basic Auth 账号密码
+# 3. 浏览器访问 https://你的域名，使用网页内注册的账号登录
 ```
 
 推送代码后，服务器由 cron 定时拉取 `develop/feature` 分支并自动重新部署（详见 DEPLOY.md 第九节）。
@@ -138,8 +138,8 @@ static/               前端页面（index.html / app.js）
 ffmpeg/               内置 FFmpeg（Windows，仅本地用；Docker 镜像用 apt 安装）
 docker-compose.prod.yml  生产编排（app + Caddy，含 healthcheck / 资源限制）
 Dockerfile            多阶段构建（运行时用 apt 安装 ffmpeg）
-Caddyfile.template    Caddy 配置模板（反向代理 + Basic Auth + 安全头）
-deploy.sh             一键部署脚本（读 .env → 生成哈希 → 渲染 Caddyfile → 启动）
+Caddyfile.template    Caddy 配置模板（HTTPS 反代 + 安全头）
+deploy.sh             一键部署脚本（读 .env → 渲染 Caddyfile → 启动）
 deploy/               服务器侧部署脚本与 systemd 开机自启单元模板
 .github/workflows/    GitHub Actions：build.yml（代码质量门禁）/ deploy.yml（SSH 私钥登录服务器本地构建部署）
 requirements.txt      依赖（curl_cffi / qrcode / Pillow）
@@ -204,7 +204,7 @@ logs/                 运行日志（自动生成）
 
 - **切勿提交 `config.json` 与 `bili_history.db*`**：两者均含隐私（登录态 / 下载记录），已写入 `.gitignore`。
 - 服务器**不向前端返回明文 SESSDATA**（`/api/config`、`/api/check_cookie` 仅告知是否已设置）。
-- **公网部署必须走 Caddy 反向代理 + Basic Auth**：应用 `server.py` 本身无登录鉴权，任何直接暴露 `8000` 端口的行为都会导致未授权访问。切勿将 `8000` 端口直接映射公网。
+- **公网部署建议走 Caddy 反向代理（HTTPS）**：应用已内置自建账号登录鉴权，但 `8000` 端口未加密；务必通过 Caddy(443) 反代加密传输，切勿将 `8000` 端口直接映射公网。
 - 默认仅本机访问；若需局域网共享，请知悉风险并自行配置防火墙。
 
 ---

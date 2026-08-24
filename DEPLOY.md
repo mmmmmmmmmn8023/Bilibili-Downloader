@@ -1,17 +1,17 @@
-# 部署指南（公网 + 域名 + 鉴权）
+# 部署指南（公网 + 域名 + 应用内账号鉴权）
 
 本文档说明如何把 Bilibili-Downloader 部署到一台**带公网 IP 的 Linux 服务器**，并通过反向代理对外提供 HTTPS 访问。
 
 ---
 
-## 一、为什么必须加鉴权
+## 一、为什么必须加 HTTPS 反代
 
-本项目自带的 Web 管理界面**没有内置登录功能**，且需要填入你的 B 站 `SESSDATA`（账号登录态）。如果直接把 `8000` 端口映射到公网，任何人都能打开界面、操作下载、并拿到你的账号凭证。
+本项目自带 Web 管理界面已内置**自建账号登录鉴权**（网页注册/登录，账号存于 `bili_history.db` 的 `users` 表），但 `server.py` 监听的 `8000` 端口**未加密**。如果直接把 `8000` 端口映射到公网，凭证会以明文传输、有被嗅探的风险。
 
-因此公网部署时，必须在前面加一层**反向代理 + 访问控制**：
+因此公网部署时，必须在前面加一层**反向代理**：
 
-- **HTTPS**：加密传输，避免凭证在公网上被窃听
-- **Basic Auth（账号密码）**：公网访问的唯一防线，挡住未授权访问
+- **HTTPS**：加密传输，避免 `SESSDATA` 等凭证在公网上被窃听
+- **应用内账号鉴权**：由 `server.py` 自建账号体系负责登录校验，Caddy 不做额外鉴权
 - **端口收敛**：应用本身只监听内部网络，公网只暴露 80/443
 
 本方案使用 [Caddy](https://caddyserver.com/) 作为反向代理——它能**自动向 Let's Encrypt 申请与续期证书**，省去手动配置 certbot 的麻烦。
@@ -22,15 +22,15 @@
 
 ```
 浏览器
-  │  HTTPS (443) + Basic Auth
+  │  HTTPS (443)  + 应用内账号鉴权
   ▼
-[Caddy 反向代理]  ← 对外 80/443（80 仅用于证书验证）
+[Caddy 反向代理]  ← 对外 80/443（80 仅用于证书验证），仅做 HTTPS 反代
   │  反向代理 http://app:8000
   ▼
-[app 容器]  ← 仅内部暴露 8000（不映射公网）
+[app 容器]  ← 仅内部暴露 8000（不映射公网），自建账号体系负责登录
   │
   ▼
-持久化卷：downloads / config.json / download_history.json / logs
+持久化卷：downloads / config.json / bili_history.db / logs
 ```
 
 ---
@@ -57,17 +57,17 @@ git checkout develop/feature
 
 # 3. 准备配置
 cp .env.example .env
-vim .env              # 填 DOMAIN / AUTH_USER / AUTH_PASS / ADMIN_EMAIL
+vim .env              # 填 DOMAIN / ADMIN_EMAIL
 
 # 4. 一键部署
 chmod +x deploy.sh
 ./deploy.sh
 
 # 5. 浏览器打开 https://你的域名
-#    输入 Basic Auth 账号密码 → 进入后在「设置」填入你的 B 站 SESSDATA
+#    首次需注册账号 → 登录后在「设置」填入你的 B 站 SESSDATA
 ```
 
-`deploy.sh` 会自动完成：检查 Docker → 读取 `.env` → 用 caddy 镜像生成密码哈希 → 生成 `Caddyfile` → **本地 `docker compose build` 构建 app 镜像**并启动容器。
+`deploy.sh` 会自动完成：检查 Docker → 读取 `.env` → 渲染并生成 `Caddyfile` → **本地 `docker compose build` 构建 app 镜像**并启动容器。
 
 > **镜像来源**：本项目**不使用 GHCR**。`app` 镜像由服务器本地 `docker compose build` 基于仓库内 `Dockerfile` 构建（`docker-compose.prod.yml` 中 `build: .`），无需云端构建或拉取远程镜像。CI（`build.yml`）仅做代码质量门禁，不参与镜像构建。
 
@@ -89,9 +89,8 @@ git pull
 # 手动重新构建并重启（不依赖 CI）
 docker compose -f docker-compose.prod.yml up -d --build
 
-# 修改 Basic Auth 密码
-vim .env              # 改 AUTH_PASS
-./deploy.sh           # 重新生成哈希与 Caddyfile 并重建 caddy
+# 管理应用内账号
+#   账号密码在网页内注册 / 登录管理（数据存于 bili_history.db 的 users 表）
 
 # 查看证书状态
 docker compose -f docker-compose.prod.yml exec caddy caddy list-certificates
@@ -104,7 +103,7 @@ docker compose -f docker-compose.prod.yml exec caddy caddy list-certificates
 ## 六、安全要点
 
 - **SESSDATA 是账号凭证**：仅在你自己的浏览器会话中填写，不要泄露给他人
-- **Basic Auth 密码务必强**：这是公网唯一防线；建议 16 位以上随机串
+- **应用内账号密码务必强**：这是你服务的访问凭证；建议 16 位以上随机串
 - **证书卷 `caddy_data` 不要删**：删了要重新申请证书
 - **端口收敛**：应用容器只 `expose 8000`（内部），公网只经 Caddy 的 80/443
 
@@ -125,7 +124,7 @@ docker compose -f docker-compose.prod.yml exec caddy caddy list-certificates
 - 把证书与私钥放到服务器，修改 `Caddyfile` 使用 `tls /path/fullchain.pem /path/privkey.pem` 替换自动申请；再 `docker compose -f docker-compose.prod.yml up -d caddy` 重建 caddy
 
 **Q：不想用 Caddy，可以用 Nginx 吗？**
-- 可以。用任意反向代理监听 443 并配置 HTTPS + Basic Auth，反代到 `http://app:8000` 即可（app 仍只暴露内部 8000）。本仓库默认提供 Caddy 方案。
+- 可以。用任意反向代理监听 443 并配置 HTTPS，反代到 `http://app:8000` 即可（鉴权由 app 内自建账号体系负责，反代层无需额外配置）。本仓库默认提供 Caddy 方案。
 
 ---
 
@@ -135,8 +134,8 @@ docker compose -f docker-compose.prod.yml exec caddy caddy list-certificates
 | --- | --- |
 | `docker-compose.prod.yml` | 生产编排：app（服务器本地 `build: .` 构建）内部 + caddy 反代 |
 | `Caddyfile.template` | Caddy 配置模板（含占位符，由 deploy.sh 渲染） |
-| `.env.example` | 配置模板（DOMAIN / AUTH_USER / AUTH_PASS / ADMIN_EMAIL） |
-| `deploy.sh` | 一键部署脚本（读 .env → 生成哈希 → 渲染 Caddyfile → 本地 build 镜像并启动 + 健康检查） |
+| `.env.example` | 配置模板（DOMAIN / ADMIN_EMAIL） |
+| `deploy.sh` | 一键部署脚本（读 .env → 渲染 Caddyfile → 本地 build 镜像并启动 + 健康检查） |
 | `.github/workflows/build.yml` | CI：推送时做代码质量门禁（语法/导入检查），不参与镜像构建 |
 | `.github/workflows/deploy.yml` | CI：通过 SSH 私钥登录服务器，调用 `deploy-bilibili.sh` 执行部署 |
 | `deploy/deploy-bilibili.sh` | 服务器侧部署脚本（SSH 调用：`git pull` + `./deploy.sh` 本地构建并重启） |
@@ -168,7 +167,7 @@ git checkout develop/feature
 
 # 2) 准备运行配置（deploy.sh 会读取 .env 并渲染 Caddyfile）
 cp .env.example .env
-vim .env                            # 填 DOMAIN / AUTH_USER / AUTH_PASS / ADMIN_EMAIL
+vim .env                            # 填 DOMAIN / ADMIN_EMAIL
 
 # 3) 首次部署
 chmod +x deploy.sh deploy/deploy-bilibili.sh
@@ -203,7 +202,7 @@ git push origin develop/feature             # 本地推送后，最多 5 分钟�
 
 ### 4. 注意事项
 
-- **凭证安全**：`.env`、`config.json`、`download_history.json` 均已被 `.gitignore` 排除，不会随代码提交。
+- **凭证安全**：`.env`、`config.json` 均已被 `.gitignore` 排除，不会随代码提交。
 - **不要本地改动被跟踪文件**：`git pull --ff-only` 只接受快进；若服务器本地改了被跟踪文件，会导致 pull 失败，需先 `git checkout .` 或 `git stash` 处理。
 - **频率权衡**：5 分钟一次足够及时；如资源敏感可改为每小时 `0 * * * *`。
 
