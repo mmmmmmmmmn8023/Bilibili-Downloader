@@ -33,8 +33,16 @@ set +a
 : "${DOMAIN:?请在 .env 中设置 DOMAIN}"
 : "${ADMIN_EMAIL:?请在 .env 中设置 ADMIN_EMAIL}"
 
-# 确保被挂载的运行时文件存在（否则 Docker 会建成目录，导致应用写入失败）
-touch config.json 2>/dev/null || true
+# 确保被挂载的运行时文件存在（否则 Docker 会建成目录，导致应用写入失败）。
+# 若历史遗留为目录（Docker 误建），先删除再 touch，保证是普通文件。
+# 注意：bili_history.db 与 config.json 都必须以【文件】形式存在，缺一不可。
+for f in config.json bili_history.db; do
+  if [ -d "$f" ]; then
+    echo "   警告：$f 是目录（历史遗留），已清理为文件"
+    rm -rf "$f"
+  fi
+  touch "$f" 2>/dev/null || true
+done
 
 echo "==> [3/7] 预检 80 / 443 端口是否被占用"
 for port in 80 443; do

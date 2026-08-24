@@ -62,6 +62,6 @@ jobs:
               -o UserKnownHostsFile=/dev/null \
               -p "${SSH_PORT}" \
               "${SSH_USER}@${SSH_HOST}" \
-              "if [ -d /var/www/Bilibili-Downloader/.git ]; then cd /var/www/Bilibili-Downloader && git fetch origin develop/feature && git checkout -- . && git reset --hard origin/develop/feature; fi; bash ${DEPLOY_SCRIPT}"
+              "if [ -d /var/www/Bilibili-Downloader/.git ]; then cd /var/www/Bilibili-Downloader && git fetch origin develop/feature && git checkout -- . && git reset --hard origin/develop/feature && cp -f deploy.sh \"${DEPLOY_SCRIPT}\"; fi; bash ${DEPLOY_SCRIPT}"
 
           echo "==> 部署命令已执行完毕"
