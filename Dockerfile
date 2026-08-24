@@ -22,7 +22,7 @@ COPY --from=builder /install /usr/local
 WORKDIR /app
 
 # 仅拷贝运行时必需的代码，其余由 .dockerignore 排除
-COPY server.py bilibili.py ./
+COPY server.py bilibili.py db.py ./
 COPY static/ ./static/
 
 EXPOSE 8000
