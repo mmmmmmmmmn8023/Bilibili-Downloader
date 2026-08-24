@@ -37,8 +37,14 @@ fi
 
 cd "$DIR"
 
-# 确保挂载所需的运行时文件/目录存在（否则 Docker 会把 ./config.json 建成目录导致写入失败）
-touch config.json download_history.json
+# 确保挂载所需的运行时文件/目录存在（否则 Docker 会把文件建成目录导致写入失败）
+# ⚠️ bili_history.db 也必须 touch：它是 SQLite 单文件库，若主机不存在，Docker 会建成一个
+#    目录，sqlite3 打开失败 → server 启动即崩溃（容器 unhealthy）。这是持久化卷新增后漏的一项。
+for f in config.json download_history.json bili_history.db; do
+  # 若上一轮部署已误建为目录，先删掉再建文件，避免 sqlite 打开失败
+  if [ -d "$f" ]; then rm -rf "$f"; fi
+  touch "$f"
+done
 mkdir -p downloads logs
 
 # 关键：调用仓库自带的 deploy.sh

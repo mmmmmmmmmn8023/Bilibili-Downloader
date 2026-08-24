@@ -1954,8 +1954,9 @@ def main():
     db.init_db()
     # 根据配置初始化 TLS 校验开关（默认 insecure_tls=true → 不校验，兼容代理/抓包）
     bilibili.VERIFY_SSL = not load_config().get("insecure_tls", True)
-    # 监听地址：默认仅本机 127.0.0.1（安全，不对外暴露）
-    host = load_config().get("host") or "127.0.0.1"
+    # 监听地址：优先用环境变量 BIND_HOST（compose 中设为 0.0.0.0，供同网络 Caddy 反代）；
+    # 未设置时回落配置 host，再回落 127.0.0.1（本地开发默认只监听本机，安全）
+    host = os.environ.get("BIND_HOST") or load_config().get("host") or "127.0.0.1"
     server = ThreadingHTTPServer((host, PORT), Handler)
     print("=" * 50)
     print("  B站下载器 已启动！")
