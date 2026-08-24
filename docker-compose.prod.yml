@@ -31,6 +31,7 @@ services:
       - ./downloads:/app/downloads
       - ./config.json:/app/config.json
       - ./download_history.json:/app/download_history.json
+      - ./bili_history.db:/app/bili_history.db
       - ./logs:/app/logs
     # 健康检查：TCP 探测 8000，确认服务已监听再放行流量
     healthcheck:
