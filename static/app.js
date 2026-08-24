@@ -2255,12 +2255,11 @@ function openCookieModal() {
 // cookie 真正失效（expired）时自动弹出设置窗口；带去重，避免每 5 分钟复检反复打扰。
 // 仅处理 expired（登录态失效）；blocked/error 是风控或网络问题，重设 cookie 无效，不弹。
 function autoOpenCookieOnProblem() {
-  const modal = document.getElementById("cookieModal");
-  if (!modal) return;
-  if (modal.classList.contains("show")) return;        // 弹窗已开，不再重复
-  if (window.__cookieExpiredPrompted) return;           // 本会话已因失效弹过
-  openCookieModal();
+  // 多用户体系下，cookie 现在归属当前登录用户。失效时不再强制全局弹窗，
+  // 改为 toast 提示用户去「设置 → Cookie 设置」自行更新本账号的 SESSDATA。
+  if (window.__cookieExpiredPrompted) return;
   window.__cookieExpiredPrompted = true;
+  showToast("⚠ SESSDATA 已过期，请在「设置 → Cookie 设置」重新填写");
 }
 function toggleCookieHelp() {
   const el = document.getElementById("cookieHelp");
@@ -2358,7 +2357,9 @@ async function verifyCookie() {
     const resp = await fetch("/api/check_cookie", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ cookie }),
+      // 不传 body cookie：后端统一使用「当前登录用户」配置中的 SESSDATA 校验，
+      // 保证多用户下状态灯反映的是本账号的登录态，而非前端旧缓存。
+      body: JSON.stringify({}),
     });
     const d = await resp.json();
     if (d.login) {
@@ -2874,4 +2875,85 @@ function selfVideoCard(v, favName = "") {
 }
 
 // ==================== 启动初始化 ====================
-initApp();
+boot();
+
+// ==================== 多用户账号（自建登录/注册/登出）====================
+let currentUser = null;
+
+async function boot() {
+  try {
+    const resp = await fetch("/api/me");
+    const d = await resp.json();
+    currentUser = d.user || null;
+  } catch (e) {
+    currentUser = null;
+  }
+  updateUserHeader();
+  if (currentUser) {
+    document.getElementById("loginOverlay").classList.remove("show");
+    initApp();
+  } else {
+    document.getElementById("loginOverlay").classList.add("show");
+  }
+}
+
+function switchAuthTab(tab) {
+  document.getElementById("loginTabBtn").classList.toggle("active", tab === "login");
+  document.getElementById("regTabBtn").classList.toggle("active", tab === "reg");
+  const err = document.getElementById("authErr");
+  if (err) err.textContent = "";
+}
+
+async function submitAuth() {
+  const user = (document.getElementById("authUser").value || "").trim();
+  const pass = document.getElementById("authPass").value || "";
+  const errEl = document.getElementById("authErr");
+  if (!user || !pass) { if (errEl) errEl.textContent = "用户名和密码均不能为空"; return; }
+  const isLogin = document.getElementById("loginTabBtn").classList.contains("active");
+  const endpoint = isLogin ? "/api/login" : "/api/register";
+  try {
+    const resp = await fetch(endpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username: user, password: pass }),
+    });
+    const d = await resp.json();
+    if (d.error) { if (errEl) errEl.textContent = d.error || "操作失败"; return; }
+    // 成功：重置跨用户数据后重新初始化主界面
+    currentUser = d.user;
+    downloadedItems = new Set();
+    cookie = "";
+    try { localStorage.removeItem("bilibili_sessdata"); } catch (e) {}
+    const ov = document.getElementById("loginOverlay");
+    if (ov) ov.classList.remove("show");
+    updateUserHeader();
+    initApp();
+  } catch (e) {
+    if (errEl) errEl.textContent = "网络错误，请重试";
+  }
+}
+
+async function logout() {
+  try {
+    await fetch("/api/logout", { method: "POST", headers: { "Content-Type": "application/json" } });
+  } catch (e) {}
+  currentUser = null;
+  downloadedItems = new Set();
+  cookie = "";
+  try { localStorage.removeItem("bilibili_sessdata"); } catch (e) {}
+  const ov = document.getElementById("loginOverlay");
+  if (ov) ov.classList.add("show");
+  updateUserHeader();
+}
+
+function updateUserHeader() {
+  const header = document.getElementById("userHeader");
+  const logoutItem = document.getElementById("logoutItem");
+  if (currentUser) {
+    if (header) header.textContent = "👤 " + currentUser;
+    if (logoutItem) logoutItem.style.display = "";
+  } else {
+    if (header) header.textContent = "未登录";
+    if (logoutItem) logoutItem.style.display = "none";
+  }
+}

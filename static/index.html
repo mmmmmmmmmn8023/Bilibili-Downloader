@@ -1702,6 +1702,8 @@
       <div class="nav-settings-item" onclick="openHistoryView(); toggleNavSettings()">下载记录</div>
       <div class="nav-settings-item" onclick="openDlModal(); toggleNavSettings()">下载设置</div>
       <div class="nav-settings-item" onclick="openAutoModal(); toggleNavSettings()">自动化下载</div>
+      <div class="nav-settings-item" style="cursor:default;color:#8b949e;" id="userHeader">未登录</div>
+      <div class="nav-settings-item" onclick="logout(); toggleNavSettings()" id="logoutItem" style="display:none;">登出</div>
       </div>
     </div>
   </div>
@@ -2072,6 +2074,21 @@
     </div>
   </footer>
 
-  <script src="/static/app.js?v=20260804-58"></script>
+  <!-- 账号登录 / 注册 覆盖层（自建多用户体系入口） -->
+  <div class="modal-overlay show" id="loginOverlay">
+    <div class="modal" style="width:340px;">
+      <h3 style="margin:0 0 14px;">账号登录</h3>
+      <div style="display:flex;gap:8px;margin-bottom:16px;">
+        <button class="btn-secondary active" id="loginTabBtn" style="flex:1;" onclick="switchAuthTab('login')">登录</button>
+        <button class="btn-secondary" id="regTabBtn" style="flex:1;" onclick="switchAuthTab('reg')">注册</button>
+      </div>
+      <input id="authUser" placeholder="用户名" autocomplete="username" style="width:100%;box-sizing:border-box;padding:10px;margin-bottom:12px;background:#0d1117;border:1px solid #30363d;color:#e6edf3;border-radius:6px;">
+      <input id="authPass" type="password" placeholder="密码" autocomplete="current-password" style="width:100%;box-sizing:border-box;padding:10px;margin-bottom:16px;background:#0d1117;border:1px solid #30363d;color:#e6edf3;border-radius:6px;" onkeydown="if(event.key==='Enter')submitAuth()">
+      <button class="btn-primary" style="width:100%;" onclick="submitAuth()">登录</button>
+      <div id="authErr" style="color:#f85149;font-size:13px;margin-top:10px;text-align:center;min-height:18px;"></div>
+    </div>
+  </div>
+
+  <script src="/static/app.js?v=20260825-1"></script>
 </body>
 </html>

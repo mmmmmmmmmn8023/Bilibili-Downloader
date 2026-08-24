@@ -143,14 +143,67 @@ def _autoclean_tasks():
         pass
 
 
-def load_config():
-    """读取配置文件（保存SESSDATA等）"""
-    with _file_lock:
-        try:
-            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except (FileNotFoundError, json.JSONDecodeError):
-            return {}
+# ========================================================
+# 多用户会话（内存态，TTL，重启失效；与 _qr_state 风格一致，零依赖）
+# ========================================================
+import secrets as _secrets
+
+SESSION_TTL = 7 * 24 * 3600
+_session_lock = threading.Lock()
+_sessions = {}  # sid -> {"user": username, "expires": float}
+
+
+def _new_session(username):
+    sid = _secrets.token_hex(16)
+    with _session_lock:
+        _sessions[sid] = {"user": username, "expires": time.time() + SESSION_TTL}
+    return sid
+
+
+def _get_session_user(sid):
+    if not sid:
+        return None
+    with _session_lock:
+        s = _sessions.get(sid)
+        if not s:
+            return None
+        if s["expires"] < time.time():
+            _sessions.pop(sid, None)
+            return None
+        return s["user"]
+
+
+def _del_session(sid):
+    if sid:
+        with _session_lock:
+            _sessions.pop(sid, None)
+
+
+def _current_sid(handler):
+    c = handler.headers.get("Cookie", "")
+    for p in c.split(";"):
+        p = p.strip()
+        if p.startswith("sid="):
+            return p[4:]
+    return None
+
+
+DEFAULT_USER = "default"
+
+
+_req_user_local = threading.local()  # 自动携带"当前请求用户"，供 load_config/save_config 无参时取用
+
+
+def _req_user(handler):
+    """当前请求归属用户：已登录取会话用户，否则回落 default（游客兜底）。"""
+    return getattr(handler, "current_user", None) or DEFAULT_USER
+
+
+def load_config(user=None):
+    """读取配置。user 为空 → 沿用当前请求用户（TLS），否则该用户独立配置。"""
+    if user is None:
+        user = getattr(_req_user_local, "user", None) or DEFAULT_USER
+    return db.load_user_config(user or DEFAULT_USER)
 
 
 def get_download_base():
@@ -159,10 +212,10 @@ def get_download_base():
     return d or DOWNLOAD_DIR
 
 
-def save_config(config):
-    with _file_lock:
-        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump(config, f, ensure_ascii=False, indent=2)
+def save_config(config, user=None):
+    if user is None:
+        user = getattr(_req_user_local, "user", None) or DEFAULT_USER
+    db.save_user_config(user or DEFAULT_USER, config)
 
 
 # ========================================================
@@ -763,12 +816,16 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         params = parse_qs(parsed.query)
+        self.current_user = _get_session_user(_current_sid(self))
+        _req_user_local.user = self.current_user
 
         try:
             if path == "/" or path == "/index.html":
                 self._serve_static("index.html", "text/html")
             elif path.startswith("/static/"):
                 self._serve_static(path[8:])
+            elif path == "/api/me":
+                self._api_me()
             elif path == "/api/search":
                 self._api_search(params)
             elif path == "/api/videos":
@@ -808,6 +865,8 @@ class Handler(BaseHTTPRequestHandler):
         """处理 POST 请求（设置cookie、发起下载）"""
         parsed = urlparse(self.path)
         path = parsed.path
+        self.current_user = _get_session_user(_current_sid(self))
+        _req_user_local.user = self.current_user
         try:
             body = self._read_body()
             data = json.loads(body) if body else {}
@@ -815,6 +874,12 @@ class Handler(BaseHTTPRequestHandler):
                 self._api_download_video(data)
             elif path == "/api/download/dynamic":
                 self._api_download_dynamic(data)
+            elif path == "/api/register":
+                self._api_register(data)
+            elif path == "/api/login":
+                self._api_login(data)
+            elif path == "/api/logout":
+                self._api_logout(data)
             elif path == "/api/config":
                 self._api_save_config(data)
             elif path == "/api/check_cookie":
@@ -877,12 +942,14 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(content)
 
-    def _json(self, data, code=200):
+    def _json(self, data, code=200, extra_headers=None):
         try:
             content = json.dumps(data, ensure_ascii=False).encode("utf-8")
             self.send_response(code)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(content)))
+            for h, v in (extra_headers or []):
+                self.send_header(h, v)
             self.end_headers()
             self.wfile.write(content)
         except (ConnectionAbortedError, BrokenPipeError, ConnectionResetError):
@@ -1550,12 +1617,12 @@ class Handler(BaseHTTPRequestHandler):
         self._json({"ok": True})
 
     def _api_history(self):
-        self._json(db.load_history())
+        self._json(db.load_history(self.current_user))
 
     def _api_clear_history(self, data=None):
         data = data or {}
         uid = str(data.get("uid") or "").strip()
-        db.clear_history(uid)
+        db.clear_history(uid, self.current_user)
         self._json({"ok": True, "uid": uid or None})
 
     def _api_history_remove(self, data):
@@ -1564,7 +1631,7 @@ class Handler(BaseHTTPRequestHandler):
         if not dyid and not bvid:
             self._json({"error": "missing dyid/bvid"}, 400)
             return
-        db.remove_history(dyid, bvid)
+        db.remove_history(dyid, bvid, self.current_user)
         self._json({"ok": True})
 
     def _api_get_config(self, params):
@@ -1657,6 +1724,47 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(content.encode("utf-8"))
 
+    # ========================================================
+    # 多用户认证端点（自建账号 + 会话 Cookie）
+    # ========================================================
+    def _session_cookie(self, sid, max_age=SESSION_TTL):
+        return "sid=%s; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=%d" % (sid, max_age)
+
+    def _api_register(self, data):
+        username = (data.get("username") or "").strip()
+        password = data.get("password") or ""
+        if not username or not password:
+            self._json({"error": "用户名和密码均不能为空"})
+            return
+        try:
+            db.create_user(username, password)
+        except ValueError as e:
+            self._json({"error": str(e)})
+            return
+        sid = _new_session(username)
+        self._json({"ok": True, "user": username},
+                    extra_headers=[("Set-Cookie", self._session_cookie(sid))])
+
+    def _api_login(self, data):
+        username = (data.get("username") or "").strip()
+        password = data.get("password") or ""
+        rec = db.get_user(username)
+        if not rec or not db.verify_password(password, rec["salt"], rec["password_hash"]):
+            self._json({"error": "用户名或密码错误"})
+            return
+        sid = _new_session(username)
+        self._json({"ok": True, "user": username},
+                    extra_headers=[("Set-Cookie", self._session_cookie(sid))])
+
+    def _api_logout(self, data):
+        _del_session(_current_sid(self))
+        self._json({"ok": True},
+                    extra_headers=[("Set-Cookie", self._session_cookie("", 0))])
+
+    def _api_me(self):
+        self._json({"user": self.current_user or None,
+                    "default": self.current_user is None})
+
     def _api_check_cookie(self, src):
         """验证 SESSDATA 是否有效，返回登录状态（供前端显示 + 下载前预检）"""
         # 兼容 GET(parse_qs, 值为列表) 和 POST(dict)
@@ -1664,9 +1772,9 @@ class Handler(BaseHTTPRequestHandler):
             cookie = src.get("cookie", "") or src.get("sessdata", "")
         else:
             cookie = src.get("cookie", [""])[0] if src.get("cookie") else ""
-        # 若未显式传入，尝试从服务端配置读取
+        # 若未显式传入，尝试从当前登录用户的配置读取
         if not cookie:
-            cookie = load_config().get("sessdata", "")
+            cookie = load_config(self.current_user).get("sessdata", "")
         if not cookie:
             self._json({"login": False, "code": -101, "msg": "未设置 SESSDATA"})
             return

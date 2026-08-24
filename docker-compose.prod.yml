@@ -10,7 +10,7 @@
 #     见 deploy-bilibili.sh / deploy.sh 中的 up -d --build
 #   - app 仅 expose 8000（内部网络），不映射公网端口
 #   - 公网只经 Caddy 的 80(证书验证) / 443(HTTPS) 暴露
-#   - Web 界面无内置登录，全靠 Caddy 的 Basic Auth 作公网唯一防线
+#   - Web 界面鉴权由应用内自建账号体系负责（Caddy 仅做 HTTPS 反代）
 
 services:
   app:

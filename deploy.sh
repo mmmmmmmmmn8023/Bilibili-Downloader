@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 #
-# Bilibili-Downloader 生产部署脚本（公网 + 域名 + 鉴权）
-# 拓扑：Caddy(443 + Basic Auth) → app(内部 8000)
+# Bilibili-Downloader 生产部署脚本（公网 + 域名）
+# 拓扑：Caddy(443 HTTPS 反代) → app(内部 8000)
+# 鉴权：应用内自建账号体系（/api/login），Caddy 不再做 Basic Auth
 #
 set -euo pipefail
 
@@ -30,8 +31,6 @@ source ./.env
 set +a
 
 : "${DOMAIN:?请在 .env 中设置 DOMAIN}"
-: "${AUTH_USER:?请在 .env 中设置 AUTH_USER}"
-: "${AUTH_PASS:?请在 .env 中设置 AUTH_PASS}"
 : "${ADMIN_EMAIL:?请在 .env 中设置 ADMIN_EMAIL}"
 
 # 确保被挂载的运行时文件存在（否则 Docker 会建成目录，导致应用写入失败）
@@ -62,18 +61,8 @@ done
 echo "==> [4/7] 拉取基础镜像（确保使用最新安全补丁）"
 docker compose -f docker-compose.prod.yml pull caddy
 
-echo "==> [5/7] 生成 Basic Auth 密码哈希"
-# 使用官方 caddy 镜像临时计算哈希，不污染宿主机
-HASH=$(docker run --rm caddy:2-alpine caddy hash-password --plaintext "$AUTH_PASS")
-if [ -z "$HASH" ]; then
-  echo "错误：生成密码哈希失败（可能拉取 caddy 镜像失败，请检查网络）"
-  exit 1
-fi
-
-echo "==> [6/7] 生成 Caddyfile"
+echo "==> [5/7] 生成 Caddyfile（仅 HTTPS 反代，鉴权由应用内账号体系负责）"
 sed -e "s|__DOMAIN__|${DOMAIN}|g" \
-    -e "s|__AUTH_USER__|${AUTH_USER}|g" \
-    -e "s|__HASH__|${HASH}|g" \
     -e "s|__ADMIN_EMAIL__|${ADMIN_EMAIL}|g" \
     Caddyfile.template > Caddyfile
 echo "    Caddyfile 已生成（域名：${DOMAIN}）"
@@ -100,8 +89,7 @@ echo ""
 if [ "$ready" -eq 1 ]; then
   echo "✅ 部署完成，app 已就绪！"
   echo "   请在浏览器访问： https://${DOMAIN}"
-  echo "   首次访问需输入 Basic Auth 账号密码（${AUTH_USER} / 你设置的密码）"
-  echo "   进入后在设置中填入你的 B 站 SESSDATA 即可开始使用。"
+  echo "   使用自建账号登录（首次需注册）；登录后在「设置 → Cookie 设置」填入你的 B 站 SESSDATA 即可开始使用。"
 else
   echo "⚠️  app 在规定时间内未通过健康检查，请排查："
   echo "     查看 app 日志： docker compose -f docker-compose.prod.yml logs -f app"

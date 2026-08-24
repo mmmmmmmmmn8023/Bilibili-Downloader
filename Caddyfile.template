@@ -7,10 +7,8 @@
 }
 
 __DOMAIN__ {
-    # 全站 Basic Auth：公网唯一防线（Web 界面本身无内置登录）
-    basicauth / {
-        __AUTH_USER__ __HASH__
-    }
+    # 鉴权已移至应用内自建账号体系（/api/login 等），Caddy 仅负责 HTTPS 反代
+    # 安全响应头与会话 Cookie（HttpOnly+Secure）由应用层保证，Caddy 不再做 Basic Auth
 
     # 限制请求体大小，防止大请求体 DoS 滥用（正常接口仅传 JSON，远小于此值）
     request_body {
