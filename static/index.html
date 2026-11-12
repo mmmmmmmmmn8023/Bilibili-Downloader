@@ -1719,6 +1719,7 @@
       <div class="nav-settings-item" onclick="openCookieModal(); toggleNavSettings()">Cookie 设置</div>
       <div class="nav-settings-item" onclick="openHistoryView(); toggleNavSettings()">下载记录</div>
       <div class="nav-settings-item" onclick="openDlModal(); toggleNavSettings()">下载设置</div>
+      <div class="nav-settings-item" onclick="openSyncModal(); toggleNavSettings()">网盘同步</div>
       <div class="nav-settings-item" onclick="openAutoModal(); toggleNavSettings()">自动化下载</div>
       <div class="nav-settings-item" style="cursor:default;color:#8b949e;" id="userHeader">未登录</div>
       <div class="nav-settings-item" onclick="logout(); toggleNavSettings()" id="logoutItem" style="display:none;">登出</div>
@@ -1991,6 +1992,59 @@
     </div>
   </div>
 
+  <!-- 网盘同步弹窗（百度网盘，bypy 上传） -->
+  <style>
+    .sync-line { font-size: 13px; color: #c9d1d9; line-height: 1.7; word-break: break-all; }
+    .sync-line.sync-ok { color: #3fb950; }
+    .sync-line.sync-bad { color: #f85149; }
+    .sync-box { border: 1px solid #30363d; border-radius: 8px; padding: 10px 12px; margin: 6px 0 10px; background: #0d1117; }
+    .sync-auth { border: 1px solid #30363d; border-radius: 8px; padding: 10px 12px; margin-top: 12px; }
+    .sync-row { display: flex; align-items: center; gap: 8px; font-size: 13px; color: #c9d1d9; margin: 8px 0; }
+    .sync-row input[type=checkbox] { width: auto; margin: 0; }
+    .sync-recent { max-height: 170px; overflow: auto; border-top: 1px solid #21262d; margin-top: 10px; padding-top: 8px; }
+  </style>
+  <div class="modal-overlay" id="syncModal">
+    <div class="modal">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px;">
+        <h3 style="margin-bottom:0;">网盘同步</h3>
+        <button class="history-close" onclick="closeSyncModal()" title="关闭">&times;</button>
+      </div>
+      <div class="dl-modal-body">
+        <label class="sync-row">
+          <input type="checkbox" id="syncEnabled">
+          <span>启用自动同步（下载完成后把新文件上传到百度网盘）</span>
+        </label>
+        <label class="dl-form-label">网盘目录 <span>(相对应用根，实际路径 /apps/bypy/<b id="syncRemoteHint">bilibili</b>)</span></label>
+        <input type="text" id="syncRemoteDir" placeholder="bilibili">
+        <div class="sync-box" id="syncStatusBox">正在读取状态…</div>
+        <label class="dl-form-label">等待文件稳定 <span>(秒，最后修改后至少等这么久才上传)</span></label>
+        <input type="number" id="syncSettle" min="10" placeholder="300">
+        <label class="dl-form-label">扫描间隔 <span>(秒)</span></label>
+        <input type="number" id="syncInterval" min="15" placeholder="60">
+        <label class="sync-row">
+          <input type="checkbox" id="syncDeleteLocal">
+          <span>上传成功后删除本地文件（默认保留）</span>
+        </label>
+        <div class="sync-auth">
+          <div style="font-size:13px;font-weight:600;color:#c9d1d9;margin-bottom:6px;">百度网盘授权</div>
+          <div id="syncAuthState" class="sync-line">读取中…</div>
+          <div style="display:flex;gap:8px;margin-top:8px;">
+            <button class="btn-secondary" onclick="syncAuthStart()">打开授权页</button>
+            <input type="text" id="syncAuthCode" placeholder="粘贴授权码" style="flex:1;">
+            <button class="btn-primary" onclick="syncAuthSubmit()">提交</button>
+          </div>
+          <div class="sync-line" style="color:#8b949e;margin-top:6px;">授权页登录后复制授权码；换机器/重装后需重新授权。</div>
+        </div>
+        <div class="sync-recent" id="syncRecent"></div>
+      </div>
+      <div class="modal-actions">
+        <button class="btn-secondary" onclick="syncScanNow()">立即扫描</button>
+        <button class="btn-secondary" onclick="closeSyncModal()">取消</button>
+        <button class="btn-primary" onclick="saveSyncConfig()">保存</button>
+      </div>
+    </div>
+  </div>
+
   <!-- 自动化下载弹窗 -->
   <div class="modal-overlay" id="autoModal">
     <div class="modal auto-modal">
@@ -2130,6 +2184,6 @@
     </div>
   </div>
 
-  <script src="/static/app.js?v=20260825-1"></script>
+  <script src="/static/app.js?v=20261112-1"></script>
 </body>
 </html>

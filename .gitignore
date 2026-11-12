@@ -11,6 +11,9 @@ bili_history.db-wal
 bili_history.db-shm
 
 # 运行时产物
+sync.json
+.bypy/
+bypy/
 logs/
 downloads/
 

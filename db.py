@@ -79,6 +79,21 @@ def init_db():
                     role          TEXT NOT NULL DEFAULT 'user'
                 )"""
             )
+            # 云端同步记录（cloudsync.py 使用）：按本地绝对路径记状态，
+            # 全局共享（不按 user 分，因为同一个下载文件只该传一次）。
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS sync_files (
+                    path      TEXT PRIMARY KEY,
+                    size      INTEGER NOT NULL DEFAULT 0,
+                    mtime     REAL NOT NULL DEFAULT 0,
+                    status    TEXT NOT NULL DEFAULT 'pending',
+                    remote    TEXT NOT NULL DEFAULT '',
+                    error     TEXT NOT NULL DEFAULT '',
+                    attempts  INTEGER NOT NULL DEFAULT 0,
+                    ts        REAL NOT NULL DEFAULT 0
+                )"""
+            )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_sync_status ON sync_files(status)")
 
             # 列迁移（针对旧库：downloads 无 user 列 / users 无 role 列）必须在建索引前、
             # 且复用同一连接执行，否则旧库建 idx_user 会因 schema 缓存失败
@@ -545,3 +560,87 @@ def remove_history(dyid=None, bvid=None, user=DEFAULT_USER):
             conn.commit()
         finally:
             conn.close()
+
+# ----------------------- 云端同步状态（cloudsync.py） -----------------------
+def sync_get(path):
+    """取单个文件的同步状态，未记录返回 {}。"""
+    path = str(path or "")
+    if not path:
+        return {}
+    with _db_lock:
+        conn = _connect()
+        try:
+            row = conn.execute(
+                "SELECT path,size,mtime,status,remote,error,attempts,ts FROM sync_files WHERE path=?",
+                (path,)).fetchone()
+        finally:
+            conn.close()
+    if not row:
+        return {}
+    return {"path": row[0], "size": row[1], "mtime": row[2], "status": row[3],
+            "remote": row[4], "error": row[5], "attempts": row[6], "ts": row[7]}
+
+
+def sync_upsert(path, size, mtime, status, remote="", error="", attempts=0):
+    """写入/更新一条同步记录。"""
+    path = str(path or "")
+    if not path:
+        return
+    with _db_lock:
+        conn = _connect()
+        try:
+            conn.execute(
+                """INSERT INTO sync_files(path,size,mtime,status,remote,error,attempts,ts)
+                   VALUES(?,?,?,?,?,?,?,?)
+                   ON CONFLICT(path) DO UPDATE SET
+                     size=excluded.size, mtime=excluded.mtime, status=excluded.status,
+                     remote=excluded.remote, error=excluded.error,
+                     attempts=excluded.attempts, ts=excluded.ts""",
+                (path, int(size or 0), float(mtime or 0), str(status or "pending"),
+                 str(remote or ""), str(error or "")[:500], int(attempts or 0), time.time()))
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def sync_counts():
+    """按状态汇总同步条数。"""
+    counts = {"done": 0, "failed": 0, "pending": 0, "total": 0}
+    with _db_lock:
+        conn = _connect()
+        try:
+            rows = conn.execute("SELECT status, COUNT(*) FROM sync_files GROUP BY status").fetchall()
+        finally:
+            conn.close()
+    for status, n in rows:
+        counts[str(status)] = int(n)
+        counts["total"] += int(n)
+    return counts
+
+
+def sync_recent(limit=20):
+    """最近的同步记录（含文件名与状态），给前端展示。"""
+    try:
+        limit = max(1, min(200, int(limit)))
+    except Exception:
+        limit = 20
+    with _db_lock:
+        conn = _connect()
+        try:
+            rows = conn.execute(
+                """SELECT path,size,status,remote,error,attempts,ts
+                   FROM sync_files ORDER BY ts DESC LIMIT ?""", (limit,)).fetchall()
+        finally:
+            conn.close()
+    out = []
+    for r in rows:
+        out.append({"path": r[0], "name": os.path.basename(r[0] or ""), "size": r[1],
+                    "status": r[2], "remote": r[3], "error": r[4],
+                    "attempts": r[5], "ts": r[6]})
+    return out
+
+
+def all_user_configs():
+    """读取 config.json 中所有用户的配置（{username: {...}}），供同步扫描收集下载目录。"""
+    with _config_lock:
+        return _normalize_config_store(_read_config_file())

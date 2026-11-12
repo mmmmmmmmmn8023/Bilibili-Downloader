@@ -24,6 +24,7 @@ import urllib.request
 
 import bilibili
 import db
+import cloudsync
 from bilibili import (
     BilibiliAPI, download_tasks, update_task, sanitize_filename, dyn_folder_type_from_dynamic,
     DownloadCancelled, cancel_task, is_cancelled, clear_cancel, clear_all_cancels, _classify_error, tasks_lock,
@@ -42,9 +43,39 @@ except Exception:
 
 PORT = 8000
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# 云端同步（百度网盘）：main() 里创建并启动；测试或未启动状态下为 None
+SYNC = None
+
+
+def _kick_sync():
+    """通知同步线程有新文件（下载成功后调用，绝不抛异常影响下载）。"""
+    if SYNC is not None:
+        try:
+            SYNC.kick()
+        except Exception:
+            pass
+
+
 STATIC_DIR = os.path.join(BASE_DIR, "static")
 DOWNLOAD_DIR = os.path.join(BASE_DIR, "downloads")
 LOGS_DIR = os.path.join(BASE_DIR, "logs")
+
+
+def _sync_download_roots():
+    """收集所有可能用到的下载目录：默认目录 + 各用户自定义 download_dir。
+
+    网盘同步是全局的，扫描要覆盖全部用户，否则别人的下载不会被备份。
+    """
+    roots = [DOWNLOAD_DIR]
+    try:
+        for _name, cfg in (db.all_user_configs() or {}).items():
+            d = str((cfg or {}).get("download_dir") or "").strip()
+            if d:
+                roots.append(d)
+    except Exception:
+        pass
+    return roots
 
 # ========================================================
 # 日志系统（控制台 + 按天滚动文件）
@@ -857,6 +888,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._api_logs_download()
             elif path == "/api/qr/status":
                 self._api_qr_status()
+            elif path == "/api/sync/status":
+                self._api_sync_status(params)
+            elif path == "/api/sync/auth_url":
+                self._api_sync_auth_url(params)
             else:
                 self._json({"error": "Not found"}, 404)
         except Exception as e:
@@ -911,6 +946,12 @@ class Handler(BaseHTTPRequestHandler):
                 self._api_qr_generate()
             elif path == "/api/qr/poll":
                 self._api_qr_poll(data)
+            elif path == "/api/sync/config":
+                self._api_sync_config(data)
+            elif path == "/api/sync/scan":
+                self._api_sync_scan(data)
+            elif path == "/api/sync/auth_code":
+                self._api_sync_auth_code(data)
             else:
                 self._json({"error": "Not found"}, 404)
         except Exception as e:
@@ -1498,6 +1539,8 @@ class Handler(BaseHTTPRequestHandler):
                     db.add_to_history(data_dyid=dynamic.get("id"), bvid="0",
                                     title=dynamic.get("title", dynamic.get("text", "")[:30]),
                                     up_uid=params.get("uid", ""), up_name=params.get("username", ""))
+            # 下载成功：唤醒网盘同步（异步扫描上传，不阻塞下载线程）
+            _kick_sync()
         except DownloadCancelled:
             update_task(task_id, "cancelled", 0, "已取消")
             clear_cancel(task_id)
@@ -1775,6 +1818,58 @@ class Handler(BaseHTTPRequestHandler):
                     "default": self.current_user is None,
                     "is_admin": bool(self.current_user and db.is_admin(self.current_user))})
 
+    # ---- 云端同步（百度网盘）----
+    def _require_sync_admin(self):
+        """同步设置是全局的：有账号体系时要求管理员；纯单机（无任何账号）时放行。"""
+        if self.current_user and db.is_admin(self.current_user):
+            return True
+        try:
+            has_users = bool(db.list_users())
+        except Exception:
+            has_users = False
+        if not has_users:
+            return True
+        self._json({"error": "需要管理员权限"}, 403)
+        return False
+
+    def _api_sync_status(self, params=None):
+        if SYNC is None:
+            self._json({"ok": False, "enabled": False, "error": "云同步未初始化"}, 503)
+            return
+        self._json(SYNC.status())
+
+    def _api_sync_config(self, data):
+        if SYNC is None:
+            self._json({"ok": False, "error": "云同步未初始化"}, 503)
+            return
+        if not self._require_sync_admin():
+            return
+        self._json(SYNC.update_config(data))
+
+    def _api_sync_scan(self, data=None):
+        if SYNC is None:
+            self._json({"ok": False, "error": "云同步未初始化"}, 503)
+            return
+        if not self._require_sync_admin():
+            return
+        self._json(SYNC.scan_now())
+
+    def _api_sync_auth_url(self, params=None):
+        if SYNC is None:
+            self._json({"ok": False, "error": "云同步未初始化"}, 503)
+            return
+        self._json({"ok": True, "url": SYNC.auth_url(),
+                    "config_dir": SYNC.config_dir(),
+                    "authorized": SYNC.authorized()})
+
+    def _api_sync_auth_code(self, data):
+        if SYNC is None:
+            self._json({"ok": False, "error": "云同步未初始化"}, 503)
+            return
+        if not self._require_sync_admin():
+            return
+        self._json(SYNC.authorize((data or {}).get("code") or ""))
+
     # ---- 管理员后台 ----
     def _require_admin(self):
         """校验当前会话为管理员；非管理员时直接回写错误并返回 False。"""
@@ -2039,6 +2134,10 @@ def main():
     # 监听地址：优先用环境变量 BIND_HOST（compose 中设为 0.0.0.0，供同网络 Caddy 反代）；
     # 未设置时回落配置 host，再回落 127.0.0.1（本地开发默认只监听本机，安全）
     host = os.environ.get("BIND_HOST") or load_config().get("host") or "127.0.0.1"
+    # 云端同步：后台线程，默认 disabled（sync.json 里 enabled=true 才真正上传）
+    global SYNC
+    SYNC = cloudsync.CloudSync(BASE_DIR, _sync_download_roots, db)
+    SYNC.start()
     server = ThreadingHTTPServer((host, PORT), Handler)
     print("=" * 50)
     print("  B站下载器 已启动！")

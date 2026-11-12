@@ -54,7 +54,7 @@ done
 if [ -f "/tmp/bili_history.db.rescued" ]; then
   cp "/tmp/bili_history.db.rescued" bili_history.db
 fi
-mkdir -p downloads logs
+mkdir -p downloads logs bypy
 
 # 关键：调用仓库自带的 deploy.sh
 #   deploy.sh 会：读 .env → 渲染 Caddyfile → up -d --build（本地构建 app 镜像）→ 健康检查

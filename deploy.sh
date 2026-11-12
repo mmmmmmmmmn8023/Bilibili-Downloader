@@ -76,6 +76,8 @@ sed -e "s|__DOMAIN__|${DOMAIN}|g" \
 echo "    Caddyfile 已生成（域名：${DOMAIN}）"
 
 echo "==> [7/7] 构建镜像并启动服务"
+# 运行期目录（含网盘同步凭据 ./bypy）先建好，避免 Docker 以 root 建目录导致写入失败
+mkdir -p downloads logs bypy
 # app 镜像由服务器本地 docker compose build 构建（不使用 GHCR）
 docker compose -f docker-compose.prod.yml up -d --build
 

@@ -1964,6 +1964,169 @@ async function saveDlSettings() {
   }
 }
 
+// ==================== 网盘同步（百度网盘） ====================
+let syncInfo = null;
+
+function openSyncModal() {
+  const el = document.getElementById("syncModal");
+  if (el) el.classList.add("show");
+  loadSyncStatus();
+}
+
+function closeSyncModal() {
+  const el = document.getElementById("syncModal");
+  if (el) el.classList.remove("show");
+}
+
+function _fmtSize(n) {
+  n = Number(n) || 0;
+  if (n >= 1024 * 1024 * 1024) return (n / 1024 / 1024 / 1024).toFixed(2) + " GB";
+  if (n >= 1024 * 1024) return (n / 1024 / 1024).toFixed(1) + " MB";
+  if (n >= 1024) return (n / 1024).toFixed(0) + " KB";
+  return n + " B";
+}
+
+function _syncLine(text, cls) {
+  const div = document.createElement("div");
+  div.className = "sync-line" + (cls ? " " + cls : "");
+  div.textContent = text;
+  return div;
+}
+
+async function loadSyncStatus() {
+  const box = document.getElementById("syncStatusBox");
+  const recent = document.getElementById("syncRecent");
+  const authState = document.getElementById("syncAuthState");
+  const g = id => document.getElementById(id);
+  try {
+    const resp = await fetch("/api/sync/status");
+    const s = await resp.json();
+    if (!s.ok) {
+      if (box) box.textContent = s.error || "读取失败";
+      return;
+    }
+    syncInfo = s;
+    const cfg = s.config || {};
+    if (g("syncEnabled")) g("syncEnabled").checked = !!cfg.enabled;
+    if (g("syncRemoteDir")) g("syncRemoteDir").value = cfg.remote_dir || "bilibili";
+    if (g("syncSettle")) g("syncSettle").value = cfg.settle_seconds || 300;
+    if (g("syncInterval")) g("syncInterval").value = cfg.interval_seconds || 60;
+    if (g("syncDeleteLocal")) g("syncDeleteLocal").checked = !!cfg.delete_local;
+    if (g("syncRemoteHint")) g("syncRemoteHint").textContent = cfg.remote_dir || "bilibili";
+
+    if (box) {
+      box.textContent = "";
+      box.appendChild(_syncLine(s.bypy_installed ? "✅ bypy 已安装" : "❌ 未安装 bypy（服务器执行 pip install bypy）",
+        s.bypy_installed ? "sync-ok" : "sync-bad"));
+      box.appendChild(_syncLine(cfg.enabled ? "自动同步：已开启" : "自动同步：已关闭"));
+      box.appendChild(_syncLine(s.authorized ? "百度网盘：已授权" : "百度网盘：未授权，需完成下方授权",
+        s.authorized ? "sync-ok" : "sync-bad"));
+      const c = s.counts || {};
+      box.appendChild(_syncLine(`已同步 ${c.done || 0} · 失败 ${c.failed || 0} · 待传 ${c.pending || 0} · 共 ${c.total || 0}`));
+      const roots = (s.roots || []).join(" ; ");
+      box.appendChild(_syncLine("扫描目录：" + (roots || "（无）")));
+      const last = s.last_scan || {};
+      if (last.ts) {
+        let line = `上次扫描 ${new Date(last.ts * 1000).toLocaleString()}：发现 ${last.found || 0}，上传 ${last.uploaded || 0}，失败 ${last.failed || 0}`;
+        if (last.error) line += "，" + last.error;
+        box.appendChild(_syncLine(line, last.error ? "sync-bad" : ""));
+      }
+    }
+    if (authState) {
+      authState.textContent = s.authorized
+        ? "已授权（凭据目录：" + s.config_dir + "）"
+        : "未授权：点「打开授权页」→ 登录百度账号 → 复制授权码粘贴到右侧";
+    }
+    if (recent) {
+      recent.textContent = "";
+      const list = s.recent || [];
+      if (!list.length) recent.appendChild(_syncLine("暂无同步记录"));
+      list.forEach(it => {
+        const mark = it.status === "done" ? "✅ " : (it.status === "failed" ? "❌ " : "⏳ ");
+        const err = it.error ? " · " + it.error : "";
+        recent.appendChild(_syncLine(mark + it.name + " · " + _fmtSize(it.size) + err,
+          it.status === "failed" ? "sync-bad" : ""));
+      });
+    }
+  } catch (e) {
+    if (box) box.textContent = "读取失败: " + e.message;
+  }
+}
+
+async function saveSyncConfig() {
+  const g = id => document.getElementById(id);
+  const payload = {
+    enabled: !!(g("syncEnabled") && g("syncEnabled").checked),
+    remote_dir: g("syncRemoteDir") ? g("syncRemoteDir").value.trim() : "",
+    settle_seconds: g("syncSettle") ? (parseInt(g("syncSettle").value, 10) || 300) : 300,
+    interval_seconds: g("syncInterval") ? (parseInt(g("syncInterval").value, 10) || 60) : 60,
+    delete_local: !!(g("syncDeleteLocal") && g("syncDeleteLocal").checked),
+  };
+  try {
+    const resp = await fetch("/api/sync/config", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const d = await resp.json();
+    if (!d.ok) { showToast(d.error || "保存失败"); return; }
+    showToast(d.config && d.config.enabled ? "已保存，自动同步已开启" : "已保存");
+    closeSyncModal();
+  } catch (e) {
+    showToast("保存失败: " + e.message);
+  }
+}
+
+async function syncScanNow() {
+  try {
+    const resp = await fetch("/api/sync/scan", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    });
+    const d = await resp.json();
+    showToast(d.ok ? "已触发扫描，稍后刷新查看结果" : (d.error || "扫描失败"));
+    if (d.ok) setTimeout(loadSyncStatus, 4000);
+  } catch (e) {
+    showToast("扫描失败: " + e.message);
+  }
+}
+
+async function syncAuthStart() {
+  try {
+    const resp = await fetch("/api/sync/auth_url");
+    const d = await resp.json();
+    if (!d.ok) { showToast(d.error || "获取授权链接失败"); return; }
+    window.open(d.url, "_blank", "noopener");
+    const codeEl = document.getElementById("syncAuthCode");
+    if (codeEl) codeEl.focus();
+    showToast("已打开授权页：登录后复制授权码，粘贴到输入框再提交");
+  } catch (e) {
+    showToast("获取授权链接失败: " + e.message);
+  }
+}
+
+async function syncAuthSubmit() {
+  const el = document.getElementById("syncAuthCode");
+  const code = el ? el.value.trim() : "";
+  if (!code) { showToast("请先粘贴授权码"); return; }
+  try {
+    const resp = await fetch("/api/sync/auth_code", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ code }),
+    });
+    const d = await resp.json();
+    showToast(d.ok ? (d.message || "授权成功") : (d.error || "授权失败"));
+    if (d.ok) {
+      if (el) el.value = "";
+      loadSyncStatus();
+    }
+  } catch (e) {
+    showToast("授权失败: " + e.message);
+  }
+}
+
 // ==================== Cookie 管理 ====================
 
 // ==================== 自动化下载弹窗 ====================
