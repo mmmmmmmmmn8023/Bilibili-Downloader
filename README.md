@@ -22,13 +22,21 @@ B站 视频 / 动态下载工具。搜索 UP主即可批量下载投稿视频与
 
 ### Windows（推荐）
 
-双击 `start.bat`：首次会自动创建虚拟环境并安装依赖，随后浏览器打开 `http://localhost:8000`。
+双击 `start.bat` 即可，**不需要预装 Python**：
+
+1. 自动探测可用的 Python 3.10+：PATH 中的 `python`/`py`（会实际执行版本检查，商店占位符会被跳过）→ 常见安装目录 → 注册表；
+2. 一个都找不到时，自动下载官方安装包（华为云 / 阿里云 / npmmirror 镜像，约 30MB）静默安装到 `%LOCALAPPDATA%\BiliDownloader\python`，**只装当前用户、不需要管理员权限**；
+3. 首次运行自动创建 `.venv` 并安装依赖（默认走清华 PyPI 镜像，失败自动回退官方源）；
+4. 启动服务并打开 `http://localhost:8000`。
+
+想跳过自动安装：先自行安装 Python 3.10+（安装时勾选 “Add python.exe to PATH”），再双击 `start.bat`。
 
 ### 手动运行
 
 ```bash
-pip install -r requirements.txt
-python server.py
+python -m venv .venv
+.venv\Scripts\python -m pip install -r requirements.txt
+.venv\Scripts\python server.py
 # 浏览器访问 http://localhost:8000
 ```
 
