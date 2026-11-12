@@ -478,7 +478,7 @@ curl "http://127.0.0.1:8000/api/status"
 
 | # | 问题 | 现在的做法 |
 |---|------|-----------|
-| 2 | 路由 if-elif 长链 | `server.py` 顶部 `GET_ROUTES` / `POST_ROUTES` 两张 `路径→Handler 方法名` 表；`do_GET`/`do_POST` 只做鉴权 + JSON 解析 + `_dispatch`。新增接口 = 加一行，测试会校验方法真实存在 |
+| 2 | 路由 if-elif 长链 | `server.py` 顶部 `GET_ROUTES` / `POST_ROUTES` 两张 `路径→Handler 方法名` 表；`do_GET`/`do_POST` 只做鉴权 + JSON 解析 + `_dispatch`。新增接口 = 加一行即可生效 |
 | 3 | 任务字典三处耦合 | `bilibili.py` 增加任务访问层：`get_task` / `snapshot_tasks(public=True)` / `cleanup_finished_tasks` / `TASK_ACTIVE_STATUS` / `TASK_PUBLIC_FIELDS`；`_api_status`、`_api_cancel_task`、`_api_retry_task`、`_autoclean_tasks` 全部改走它，不再各自持锁拼字典 |
 | 4 | PORT 硬编码 + 自调用耦合 | `DEFAULT_PORT` + `_resolve_port()`：环境变量 `BILI_DL_PORT` > `config["port"]` > 8000；`main()` 绑定后用真实端口回填 `PORT`，`_auto_submit` 统一用 `_server_base_url()`。端口被占用会打印明确提示并退出 |
 | 5 | 画质表双写 | `bilibili.py` 唯一数据源 `QN_TABLE`，`QN_LABEL` 与 `DASH_QNS` 都由它派生；`get_play_url` 的局部 `DASH_QNS` 已删 |
@@ -488,12 +488,5 @@ curl "http://127.0.0.1:8000/api/status"
 
 顺带修复：`_api_clear_tasks(scope="all")` 不再 `clear()` 掉正在下载的任务（线程还在跑却失去句柄），只清已结束的，并返回 `removed` / `active_kept`。
 
-**测试**（不需要联网、不需要 curl_cffi/ffmpeg）：
-
-```powershell
-cd D:\tool\blbld
-python -m unittest discover -s tests -v      # 18 个用例
-```
-
-`tests/test_core.py` 覆盖迁移/去重/画质表/任务快照/路由表/脱敏/端口解析；`tests/test_server_http.py` 真起一个 `ThreadingHTTPServer`，验证静态文件、404、400、401 鉴权、config 脱敏。
+**改完怎么验**：`.\start.bat` 起服务后，`curl http://127.0.0.1:8000/api/status` 应返回 `{"tasks":{}}`；`curl http://127.0.0.1:8000/api/config` 只应看到 `has_sessdata` / `sessdata_masked`，**不再有明文 SESSDATA 与 access_token**。
 
