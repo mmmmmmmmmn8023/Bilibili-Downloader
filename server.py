@@ -27,6 +27,7 @@ import db
 from bilibili import (
     BilibiliAPI, download_tasks, update_task, sanitize_filename, dyn_folder_type_from_dynamic,
     DownloadCancelled, cancel_task, is_cancelled, clear_cancel, clear_all_cancels, _classify_error, tasks_lock,
+    get_task, snapshot_tasks, TASK_ACTIVE_STATUS,
 )
 
 try:
@@ -40,12 +41,68 @@ except Exception:
 # 配置
 # ========================================================
 
-PORT = 8000
+DEFAULT_PORT = 8000
+# 实际监听端口：main() 里按 env BILI_DL_PORT → config["port"] → 8000 解析后覆盖。
+# 以前这里是硬编码 8000，而自动下载又通过 http://127.0.0.1:8000 自调用复用队列，
+# 改端口就静默全挂；现在两处都走 _server_base_url()，只有这一个来源。
+PORT = DEFAULT_PORT
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
 DOWNLOAD_DIR = os.path.join(BASE_DIR, "downloads")
 CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
 LOGS_DIR = os.path.join(BASE_DIR, "logs")
+
+
+def _server_base_url():
+    """本进程 HTTP 服务的自调用基址（自动下载的内部 HTTP 提交用）。"""
+    return f"http://127.0.0.1:{PORT}"
+
+
+def _is_loopback_host(host):
+    """监听地址是否只对本机开放。非回环（0.0.0.0 / 局域网 IP）需要 token 鉴权。"""
+    h = (host or "").strip().lower()
+    return h in ("127.0.0.1", "localhost", "::1", "")
+
+
+def _resolve_port(cfg=None):
+    """端口解析优先级：环境变量 BILI_DL_PORT > config.json 的 port > 8000。"""
+    env = (os.environ.get("BILI_DL_PORT") or "").strip()
+    if env:
+        try:
+            return int(env), "env BILI_DL_PORT"
+        except ValueError:
+            pass
+    try:
+        raw = (cfg or {}).get("port")
+        if raw:
+            return int(raw), "config.port"
+    except Exception:
+        pass
+    return DEFAULT_PORT, "default"
+
+
+# 非回环监听时的访问令牌。None = 不需要鉴权（默认 127.0.0.1）。
+# 由 main() 在 host 非回环时生成/读取 config["access_token"]，并注入 index.html，
+# 同时以 SameSite=Strict 的 cookie 下发，浏览器后续请求自动携带。
+ACCESS_TOKEN = None
+_COOKIE_TOKEN = "bili_token"
+
+
+def _get_access_token(cfg=None):
+    """读取/生成访问令牌（持久化到 config.json，避免每次重启换令牌）。"""
+    try:
+        cfg = dict(cfg if cfg is not None else load_config())
+        tok = (cfg or {}).get("access_token") or ""
+        if tok:
+            return tok
+        import secrets
+        tok = secrets.token_urlsafe(24)
+        cfg["access_token"] = tok
+        save_config(cfg)   # 注意 save_config 是整文件覆盖，必须先合并再写
+        return tok
+    except Exception:
+        return ""
+
 
 # ========================================================
 # 日志系统（控制台 + 按天滚动文件）
@@ -128,19 +185,9 @@ def get_download_executor():
 
 
 def _autoclean_tasks():
-    """任务总数过多时，清理最旧的已完成任务，保留最近的 TASK_KEEP_DONE 条。"""
-    try:
-        with tasks_lock:
-            if len(download_tasks) <= TASK_AUTO_CLEANUP_THRESHOLD:
-                return
-            finished = [tid for tid, t in download_tasks.items()
-                        if t.get("status") in ("done", "error", "cancelled")]
-            finished.sort(key=lambda tid: download_tasks[tid].get("time", 0))
-            remove = finished[:-TASK_KEEP_DONE] if len(finished) > TASK_KEEP_DONE else []
-            for tid in remove:
-                download_tasks.pop(tid, None)
-    except Exception:
-        pass
+    """任务总数过多时清理最旧的已结束任务（实现收敛到 bilibili.cleanup_finished_tasks）。"""
+    return bilibili.cleanup_finished_tasks(
+        max_total=TASK_AUTO_CLEANUP_THRESHOLD, keep=TASK_KEEP_DONE)
 
 
 def load_config():
@@ -520,9 +567,11 @@ def _auto_submit(kind, params, retry_on_full=True):
     文件设置、独立缓存目录、与手动下载行为完全一致。
     kind: 'video' | 'dynamic'。server 是 ThreadingHTTPServer，内部 HTTP 自调用会开新线程处理，
     不会死锁。
-    retry_on_full: 当队列满（HTTP 429）时，做 1 次轻量延迟重试，避免瞬时并发打满导致漏下。
+
+    地址不再写死 127.0.0.1:8000，而是走 _server_base_url()（PORT 由 env/config 解析，
+    绑定后以真实端口回填），因此改端口不会再让自动下载静默全挂。
     """
-    url = f"http://127.0.0.1:{PORT}/api/download/{kind}"
+    url = f"{_server_base_url()}/api/download/{kind}"
     data = json.dumps(params, ensure_ascii=False).encode("utf-8")
 
     def _do_post():
@@ -549,7 +598,7 @@ def _auto_submit(kind, params, retry_on_full=True):
         auto_log(f"自动提交下载失败({kind}): {e}", "error")
         return False
     except Exception as e:
-        auto_log(f"自动提交下载失败({kind}): {e}", "error")
+        auto_log(f"自动提交下载失败({kind}): {e}（服务地址 {_server_base_url()}）", "error")
         return False
 
 
@@ -751,6 +800,47 @@ def _auto_download_up(api, uid, uname, seen=None):
 
 
 # ========================================================
+# 路由表
+#   以前是 do_GET / do_POST 里两条 if-elif 长链，新增接口要在几百行里找位置、改完
+#   还容易漏（例如 GET/POST 同名不同处理）。现在集中成两张表：
+#   路径 → Handler 方法名。新增接口 = 加一行；测试会校验每个名字在 Handler 上存在。
+# ========================================================
+GET_ROUTES = {
+    "/api/search": "_api_search",
+    "/api/videos": "_api_videos",
+    "/api/dynamics": "_api_dynamics",
+    "/api/status": "_api_status",
+    "/api/history": "_api_history",
+    "/api/config": "_api_get_config",
+    "/api/check_cookie": "_api_check_cookie",
+    "/api/self": "_api_self",
+    "/api/watchlater": "_api_watchlater",
+    "/api/favorites": "_api_favorites",
+    "/api/video_pages": "_api_video_pages",
+    "/api/video_page_counts": "_api_video_page_counts",
+    "/api/auto/log": "_api_auto_log",
+    "/api/logs/download": "_api_logs_download",
+    "/api/qr/status": "_api_qr_status",
+}
+
+POST_ROUTES = {
+    "/api/download/video": "_api_download_video",
+    "/api/download/dynamic": "_api_download_dynamic",
+    "/api/config": "_api_save_config",
+    "/api/check_cookie": "_api_check_cookie",
+    "/api/history/clear": "_api_clear_history",
+    "/api/history/remove": "_api_history_remove",
+    "/api/auto/check": "_api_auto_check",
+    "/api/auto/status": "_api_auto_status",
+    "/api/download/cancel": "_api_cancel_task",
+    "/api/download/retry": "_api_retry_task",
+    "/api/tasks/clear": "_api_clear_tasks",
+    "/api/qr/generate": "_api_qr_generate",
+    "/api/qr/poll": "_api_qr_poll",
+}
+
+
+# ========================================================
 # 请求处理器
 # ========================================================
 
@@ -762,85 +852,77 @@ class Handler(BaseHTTPRequestHandler):
         """处理 GET 请求（网页访问 + API 查询）"""
         parsed = urlparse(self.path)
         path = parsed.path
-        params = parse_qs(parsed.query)
-
         try:
-            if path == "/" or path == "/index.html":
+            if not self._guard(path):
+                return
+            if path in ("/", "/index.html"):
                 self._serve_static("index.html", "text/html")
             elif path.startswith("/static/"):
                 self._serve_static(path[8:])
-            elif path == "/api/search":
-                self._api_search(params)
-            elif path == "/api/videos":
-                self._api_videos(params)
-            elif path == "/api/dynamics":
-                self._api_dynamics(params)
-            elif path == "/api/status":
-                self._api_status()
-            elif path == "/api/history":
-                self._api_history()
-            elif path == "/api/config":
-                self._api_get_config(params)
-            elif path == "/api/check_cookie":
-                self._api_check_cookie(params)
-            elif path == "/api/self":
-                self._api_self(params)
-            elif path == "/api/watchlater":
-                self._api_watchlater(params)
-            elif path == "/api/favorites":
-                self._api_favorites(params)
-            elif path == "/api/video_pages":
-                self._api_video_pages(params)
-            elif path == "/api/video_page_counts":
-                self._api_video_page_counts(params)
-            elif path == "/api/auto/log":
-                self._api_auto_log(params)
-            elif path == "/api/logs/download":
-                self._api_logs_download()
-            elif path == "/api/qr/status":
-                self._api_qr_status()
             else:
-                self._json({"error": "Not found"}, 404)
+                self._dispatch(GET_ROUTES, parse_qs(parsed.query))
         except Exception as e:
             self._json({"error": str(e)}, 500)
 
     def do_POST(self):
         """处理 POST 请求（设置cookie、发起下载）"""
-        parsed = urlparse(self.path)
-        path = parsed.path
+        path = urlparse(self.path).path
         try:
+            if not self._guard(path):
+                return
             body = self._read_body()
-            data = json.loads(body) if body else {}
-            if path == "/api/download/video":
-                self._api_download_video(data)
-            elif path == "/api/download/dynamic":
-                self._api_download_dynamic(data)
-            elif path == "/api/config":
-                self._api_save_config(data)
-            elif path == "/api/check_cookie":
-                self._api_check_cookie(data)
-            elif path == "/api/history/clear":
-                self._api_clear_history(data)
-            elif path == "/api/history/remove":
-                self._api_history_remove(data)
-            elif path == "/api/auto/check":
-                self._api_auto_check()
-            elif path == "/api/auto/status":
-                self._api_auto_status(data)
-            elif path == "/api/download/cancel":
-                self._api_cancel_task(data)
-            elif path == "/api/download/retry":
-                self._api_retry_task(data)
-            elif path == "/api/tasks/clear":
-                self._api_clear_tasks(data)
-            elif path == "/api/qr/generate":
-                self._api_qr_generate()
-            elif path == "/api/qr/poll":
-                self._api_qr_poll(data)
-            else:
-                self._json({"error": "Not found"}, 404)
+            try:
+                data = json.loads(body) if body else {}
+            except json.JSONDecodeError:
+                self._json({"error": "请求体不是合法 JSON"}, 400)
+                return
+            if not isinstance(data, dict):
+                self._json({"error": "请求体必须是 JSON 对象"}, 400)
+                return
+            self._dispatch(POST_ROUTES, data)
         except Exception as e:
             self._json({"error": str(e)}, 500)
+
+    # ---- 路由辅助 ----
+
+    def _dispatch(self, routes, payload):
+        """按路由表分发；未命中返回 404（与旧行为一致）。"""
+        name = routes.get(urlparse(self.path).path)
+        if not name:
+            self._json({"error": "Not found"}, 404)
+            return
+        getattr(self, name)(payload)
+
+    def _guard(self, path):
+        """访问控制：仅当监听地址非回环时才要求 token（默认 127.0.0.1 无需鉴权）。
+
+        返回 False 表示已拒绝并已写出 401 响应。
+        """
+        if ACCESS_TOKEN is None or not path.startswith("/api/"):
+            return True
+        if self._has_valid_token():
+            return True
+        self._json({"error": "unauthorized", "hint": "需要访问令牌（见 config.json 的 access_token）"}, 401)
+        return False
+
+    def _has_valid_token(self):
+        import hmac
+        # 1) 请求头（curl / 脚本）
+        tok = self.headers.get("X-Access-Token") or ""
+        # 2) 查询串 ?token=...
+        if not tok:
+            tok = (parse_qs(urlparse(self.path).query).get("token") or [""])[0]
+        # 3) cookie（浏览器访问首页时由服务端下发，自动携带）
+        if not tok:
+            for part in (self.headers.get("Cookie") or "").split(";"):
+                k, _, v = part.strip().partition("=")
+                if k == _COOKIE_TOKEN and v:
+                    tok = v
+                    break
+        try:
+            return bool(tok) and hmac.compare_digest(tok, ACCESS_TOKEN)
+        except Exception:
+            return False
 
     # ---- 辅助方法 ----
 
@@ -874,6 +956,13 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(content)))
         # 禁用静态文件缓存，避免浏览器沿用旧的 app.js/index.html（前端改动后必须强刷才生效）
         self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+        # 非回环监听：打开首页时下发访问令牌 cookie（HttpOnly，JS 读不到，浏览器自动携带），
+        # 这样前端代码不需要知道 token，API 也不会对公网裸奔。
+        if ACCESS_TOKEN and filename == "index.html":
+            self.send_header(
+                "Set-Cookie",
+                f"{_COOKIE_TOKEN}={ACCESS_TOKEN}; Path=/; HttpOnly; SameSite=Strict",
+            )
         self.end_headers()
         self.wfile.write(content)
 
@@ -1474,23 +1563,24 @@ class Handler(BaseHTTPRequestHandler):
             )
         finally:
             clear_cancel(task_id)
-    def _api_status(self):
-        """查询所有下载任务的状态（前端轮询这个接口获取进度）"""
+    def _api_status(self, _payload=None):
+        """查询所有下载任务的状态（前端轮询这个接口获取进度）。
+
+        走 bilibili.snapshot_tasks()：只下发公开字段，params（含 SESSDATA 与整包动态
+        JSON）不会出现在响应里。前端本来也不用 params，重试在服务端用完整字典。
+        """
         _autoclean_tasks()
-        with tasks_lock:
-            snapshot = dict(download_tasks)
-        self._json({"tasks": snapshot})
+        self._json({"tasks": snapshot_tasks()})
 
     def _api_cancel_task(self, data):
         """取消一条进行中/排队的下载任务。"""
         task_id = data.get("task_id", "")
-        with tasks_lock:
-            t = download_tasks.get(task_id)
-            if not t:
-                self._json({"ok": False, "error": "任务不存在"})
-                return
-            status = t.get("status")
-            progress = t.get("progress", 0)
+        t = get_task(task_id)
+        if not t:
+            self._json({"ok": False, "error": "任务不存在"})
+            return
+        status = t.get("status")
+        progress = t.get("progress", 0)
         if status in ("done", "error", "cancelled"):
             self._json({"ok": False, "error": "任务已结束，无法取消"})
             return
@@ -1510,23 +1600,21 @@ class Handler(BaseHTTPRequestHandler):
     def _api_retry_task(self, data):
         """重试一条失败/已取消的任务（用其保存的 params 重新入队）。"""
         task_id = data.get("task_id", "")
-        with tasks_lock:
-            t = download_tasks.get(task_id)
-            if not t:
-                self._json({"ok": False, "error": "任务不存在"})
-                return
-            params = t.get("params")
-            dup_key = self._task_bvid(t) if params else ""
-            # 去重：若已有同 bvid/动态 id 的进行中任务，跳过重复提交，避免列表出现重复任务
-            if dup_key:
-                for tid, ot in list(download_tasks.items()):
-                    if tid == task_id:
-                        continue
-                    if ot.get("status") in ("queued", "downloading", "merging", "cancelling"):
-                        if self._task_bvid(ot) == dup_key:
-                            self._json({"ok": False, "reason": "active_exists",
-                                        "message": f"该视频正在下载中（任务 {tid[:6]}），已跳过重复提交"})
-                            return
+        t = get_task(task_id)
+        if not t:
+            self._json({"ok": False, "error": "任务不存在"})
+            return
+        params = t.get("params")
+        dup_key = self._task_bvid(t) if params else ""
+        # 去重：若已有同 bvid/动态 id 的进行中任务，跳过重复提交，避免列表出现重复任务
+        if dup_key:
+            for tid, ot in snapshot_tasks(public=False).items():
+                if tid == task_id:
+                    continue
+                if ot.get("status") in TASK_ACTIVE_STATUS and self._task_bvid(ot) == dup_key:
+                    self._json({"ok": False, "reason": "active_exists",
+                                "message": f"该视频正在下载中（任务 {tid[:6]}），已跳过重复提交"})
+                    return
         if not params:
             self._json({"ok": False, "error": "该任务缺少重试参数"})
             return
@@ -1536,20 +1624,28 @@ class Handler(BaseHTTPRequestHandler):
         self._json({"ok": True, "task_id": new_id})
 
     def _api_clear_tasks(self, data):
-        """清理任务列表。scope: 'finished'=仅已完成(done)；'all'=全部（含失败/取消/进行中）。"""
-        scope = data.get("scope", "finished")
-        with tasks_lock:
-            if scope == "all":
-                download_tasks.clear()
-                clear_all_cancels()  # 同步清理取消标记集
-            else:
-                # 「清空已完成」只清真正成功的(done)；失败(error)/取消(cancelled)保留，便于重试/查看
-                for tid in list(download_tasks.keys()):
-                    if download_tasks[tid].get("status") == "done":
-                        download_tasks.pop(tid, None)
-        self._json({"ok": True})
+        """清理任务列表。
 
-    def _api_history(self):
+        scope='finished'：只清成功(done)的任务，失败/取消保留，便于重试/查看。
+        scope='all'：清掉所有**已结束**任务（done/error/cancelled）。
+        注意：未结束的任务永远不会被清掉——以前 'all' 直接 clear()，会把正在下载的
+        任务从字典里抹掉，线程还在跑却再也取消不了、进度也永远看不到。
+        """
+        scope = data.get("scope", "finished")
+        targets = ("done",) if scope != "all" else ("done", "error", "cancelled")
+        removed = 0
+        with tasks_lock:
+            for tid in list(download_tasks.keys()):
+                if download_tasks[tid].get("status") in targets:
+                    download_tasks.pop(tid, None)
+                    removed += 1
+            active = sum(1 for t in download_tasks.values()
+                         if t.get("status") not in ("done", "error", "cancelled"))
+        if scope == "all" and not active:
+            clear_all_cancels()  # 没有在跑的任务时才清取消标记集
+        self._json({"ok": True, "removed": removed, "active_kept": active})
+
+    def _api_history(self, _payload=None):
         self._json(db.load_history())
 
     def _api_clear_history(self, data=None):
@@ -1568,15 +1664,27 @@ class Handler(BaseHTTPRequestHandler):
         self._json({"ok": True})
 
     def _api_get_config(self, params):
+        """返回配置。**SESSDATA 与访问令牌永远不出现明文**，只给 has_sessdata / 掩码。
+
+        前端已改为「cookie 留空 → 后端从 config 兜底」，所以不再需要明文同步；
+        这同时堵住了 README 里承诺过、代码却一直没做到的泄漏点。
+        """
         config = load_config()
-        # 本地部署：返回明文 SESSDATA（本机浏览器即用户本人，无脱敏必要）。
-        # 前端 initApp 依赖 data.sessdata 同步 cookie；脱敏会导致 cookie=undefined 连锁故障。
         cfg_out = dict(config)
-        cfg_out["has_sessdata"] = bool(cfg_out.get("sessdata"))
+        raw = cfg_out.pop("sessdata", "") or ""
+        cfg_out.pop("access_token", None)
+        cfg_out["sessdata"] = ""
+        cfg_out["has_sessdata"] = bool(raw)
+        cfg_out["sessdata_masked"] = _mask_secret(raw)
         self._json(cfg_out)
 
     def _api_save_config(self, data):
         config = load_config()
+        data = dict(data or {})
+        # 防止前端把脱敏值原样回传覆盖真实 SESSDATA；令牌只允许服务端生成
+        if "*" in str(data.get("sessdata") or ""):
+            data.pop("sessdata", None)
+        data.pop("access_token", None)
         config.update(data)
         save_config(config)
         # 若涉及 TLS 校验开关，立即同步到运行中的 API 客户端
@@ -1586,9 +1694,9 @@ class Handler(BaseHTTPRequestHandler):
         if "auto_interval" in data or "auto_schedule_enabled" in data:
             stop_auto_scheduler()
             start_auto_scheduler()
-        self._json({"ok": True})
+        self._json({"ok": True, "has_sessdata": bool(config.get("sessdata"))})
 
-    def _api_auto_check(self):
+    def _api_auto_check(self, _payload=None):
         """手动触发一次检查（后台线程执行，不阻塞响应）"""
         threading.Thread(target=lambda: _do_auto_check(label="手动检查"), daemon=True).start()
         self._json({"ok": True})
@@ -1641,7 +1749,7 @@ class Handler(BaseHTTPRequestHandler):
         running = _auto_busy
         self._json({"logs": logs, "last_id": last_id, "running": running})
 
-    def _api_logs_download(self):
+    def _api_logs_download(self, _payload=None):
         """下载完整日志文件"""
         log_path = os.path.join(LOGS_DIR, "server.log")
         if not os.path.isfile(log_path):
@@ -1675,10 +1783,9 @@ class Handler(BaseHTTPRequestHandler):
             result = api.check_login()
         except Exception as e:
             result = {"login": False, "code": -1, "msg": str(e)}
-        # 本地部署：回传明文 SESSDATA（前端 verifyCookie 依赖 d.sessdata 同步 cookie 到 localStorage；
-        # 仅返回布尔会导致 cookie=undefined 连锁故障）。同时保留 has_sessdata 兼容旧前端。
+        # 只回传状态与掩码，不回传明文（前端已改为依赖服务端配置，不再需要同步 cookie）
         result["has_sessdata"] = bool(cookie)
-        result["sessdata"] = cookie
+        result["sessdata_masked"] = _mask_secret(cookie)
         self._json(result)
 
     def _api_self(self, params):
@@ -1722,7 +1829,7 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- 扫码登录（二维码）----
 
-    def _api_qr_generate(self):
+    def _api_qr_generate(self, _payload=None):
         """生成登录二维码：返回 base64 PNG 图片 + 票据 key。
         若 qrcode 库缺失，返回 qr_unavailable 提示前端改用 Cookie 输入。
         """
@@ -1792,8 +1899,9 @@ class Handler(BaseHTTPRequestHandler):
             bilibili.VERIFY_SSL = not cfg.get("insecure_tls", True)
             # 用新 cookie 取登录信息，回传前端
             info = BilibiliAPI(cookie).get_self_info() if cookie else {"login": False}
-            self._json({"ok": True, "status": "success", "cookie": cookie,
-                        "sessdata": sess, "self": info})
+            # 只回传登录结果与掩码：明文 SESSDATA 已写入 config.json，前端不需要也不该持有。
+            self._json({"ok": True, "status": "success", "has_sessdata": bool(sess),
+                        "sessdata_masked": _mask_secret(sess), "self": info})
             return
 
         # 未成功：回传当前状态（含失效/待确认/未扫码）
@@ -1801,7 +1909,7 @@ class Handler(BaseHTTPRequestHandler):
                     "message": res.get("message", ""),
                     "code": res.get("code")})
 
-    def _api_qr_status(self):
+    def _api_qr_status(self, _payload=None):
         """查询当前二维码的剩余有效期与最近状态（供前端刷新倒计时/过期判定）。"""
         with _qr_lock:
             expires = _qr_state.get("expires_at", 0)
@@ -1840,18 +1948,46 @@ class Handler(BaseHTTPRequestHandler):
 # 启动
 # ========================================================
 
+def _mask_secret(value):
+    """脱敏展示：保留首尾各 4 位，中间打码（长度 ≤12 时整串打码）。"""
+    s = str(value or "")
+    if not s:
+        return ""
+    if len(s) <= 12:
+        return "*" * len(s)
+    return f"{s[:4]}{'*' * 8}{s[-4:]}"
+
+
 def main():
+    global PORT, ACCESS_TOKEN
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-    # 初始化下载历史数据库（SQLite），首次运行自动建表
+    # 初始化下载历史数据库（SQLite），首次运行自动建表 + 迁移
     db.init_db()
+    cfg = load_config()
     # 根据配置初始化 TLS 校验开关（默认 insecure_tls=true → 不校验，兼容代理/抓包）
-    bilibili.VERIFY_SSL = not load_config().get("insecure_tls", True)
+    bilibili.VERIFY_SSL = not cfg.get("insecure_tls", True)
+    # 端口：env BILI_DL_PORT > config["port"] > 8000（旧版硬编码 8000，自动下载自调用也跟着挂）
+    PORT, port_src = _resolve_port(cfg)
     # 监听地址：默认仅本机 127.0.0.1（安全，不对外暴露）
-    host = load_config().get("host") or "127.0.0.1"
-    server = ThreadingHTTPServer((host, PORT), Handler)
+    host = cfg.get("host") or "127.0.0.1"
+    try:
+        server = ThreadingHTTPServer((host, PORT), Handler)
+    except OSError as e:
+        print(f"[启动失败] 无法监听 {host}:{PORT} — {e}")
+        print("  端口被占用时可用环境变量 BILI_DL_PORT 或 config.json 的 port 换一个。")
+        raise SystemExit(1)
+    # 以真实绑定端口回填（port=0 或绑定异常时也能拿到正确值，供内部自调用使用）
+    PORT = server.server_address[1]
+    if not _is_loopback_host(host):
+        ACCESS_TOKEN = _get_access_token(cfg) or None
+        if ACCESS_TOKEN:
+            print(f"[安全] 正在监听非回环地址 {host}:{PORT}，已启用访问令牌鉴权。")
+            print(f"       令牌存储于 config.json 的 access_token；浏览器首次访问会自动下发 cookie。")
+        else:
+            print("[警告] 非回环监听但生成访问令牌失败，接口可能拒绝服务。")
     print("=" * 50)
     print("  B站下载器 已启动！")
-    print(f"  浏览器打开: http://localhost:{PORT}")
+    print(f"  浏览器打开: http://localhost:{PORT}  (端口来源: {port_src})")
     print(f"  下载目录:   {get_download_base()}")
     print("  按 Ctrl+C 停止服务器")
     print("=" * 50)

@@ -266,9 +266,22 @@ def sanitize_filename(name):
     return name.strip("/")[:100]  # 限制长度，避免路径太长
 
 
-# 画质代码 → 标签
-QN_LABEL = {127: "最高画质", 120: "4K", 116: "1080P60", 112: "1080P+",
-            80: "1080P", 64: "720P", 32: "480P", 16: "360P"}
+# 画质代码 → 标签：**唯一数据源**，顺序即请求播放地址时的降级顺序（高 → 低）。
+# 以前 QN_LABEL 与 get_play_url 里的 DASH_QNS 各写一份，改一处漏一处会导致
+# 「标签显示了 1080P60 但实际只请求了 720P」这类隐性错位；现统一从这里派生。
+QN_TABLE = (
+    (127, "最高画质"),
+    (120, "4K"),
+    (116, "1080P60"),
+    (112, "1080P+"),
+    (80, "1080P"),
+    (64, "720P"),
+    (32, "480P"),
+    (16, "360P"),
+)
+QN_LABEL = dict(QN_TABLE)
+# 降级请求顺序：高画质 → 低画质（get_play_url 使用）
+DASH_QNS = [qn for qn, _ in QN_TABLE]
 
 
 def _resolve_quality_label(play_data, chosen_id):
@@ -332,6 +345,65 @@ def update_task(task_id, status, progress, message, quality=None,
             if file_path is not None:
                 t["file_path"] = file_path
             download_tasks[task_id] = t
+
+
+# ========================================================
+# 任务状态访问层
+#   server.py 统一通过这些函数读写 download_tasks，不再到处 dict(download_tasks)
+#   或持锁遍历。好处：快照永远剔除敏感字段（params 里带 cookie 和完整动态 JSON）、
+#   字段集合只有一处定义，前端/重试/清理三处不会各写一份。
+# ========================================================
+# 允许下发给前端的任务字段（params 故意不在列：里面有 SESSDATA 和整包动态数据）
+TASK_PUBLIC_FIELDS = (
+    "status", "progress", "message", "time", "title", "upname", "type",
+    "quality", "error_code", "error_detail", "file_path", "retry",
+)
+
+# 未结束的任务状态（用于并发去重 / 面板判定）
+TASK_ACTIVE_STATUS = ("queued", "downloading", "merging", "cancelling", "retrying")
+
+
+def get_task(task_id):
+    """取一条任务的浅拷贝（不含锁）。调用方只读时安全，写入请用 update_task。"""
+    with tasks_lock:
+        t = download_tasks.get(task_id)
+        return dict(t) if t else None
+
+
+def snapshot_tasks(public=True):
+    """返回全部任务快照。
+
+    public=True（默认）：只保留 TASK_PUBLIC_FIELDS，剔除 params（含 cookie）等敏感数据，
+    供 /api/status 直接下发；public=False：内部使用，返回完整深拷贝。
+    """
+    with tasks_lock:
+        items = [(tid, dict(t)) for tid, t in download_tasks.items()]
+    if not public:
+        return {tid: t for tid, t in items}
+    out = {}
+    for tid, t in items:
+        view = {k: t[k] for k in TASK_PUBLIC_FIELDS if k in t}
+        view.setdefault("status", "")
+        view.setdefault("progress", 0)
+        out[tid] = view
+    return out
+
+
+def cleanup_finished_tasks(max_total=150, keep=50):
+    """任务数超过 max_total 时，删掉最旧的已结束任务，只保留最近 keep 条。
+
+    只清理 done/error/cancelled，绝不动未结束的任务（原实现同样如此）。"""
+    with tasks_lock:
+        if len(download_tasks) <= max_total:
+            return 0
+        finished = [(tid, t) for tid, t in download_tasks.items()
+                    if t.get("status") in ("done", "error", "cancelled")]
+        finished.sort(key=lambda kv: kv[1].get("time") or 0)
+        removed = 0
+        for tid, _ in finished[:max(0, len(finished) - keep)]:
+            download_tasks.pop(tid, None)
+            removed += 1
+        return removed
 
 
 # ========================================================
@@ -1564,8 +1636,8 @@ class BilibiliAPI:
         # qn 为用户选择的"期望最高画质"，实际返回受账号等级（大会员等）限制；
         # 按从高到低逐级降级请求，保证拿到账号可达的最高画质且不超过所选上限。
         # fnval=4048 = DASH(16)|4K(64)|HDR(128)|Dolby(256)|DolbyAudio(512)|臻彩(1024)|8K(2048)
-        DASH_QNS = [127, 120, 116, 112, 80, 64, 32, 16]
-        chosen = qn if qn in DASH_QNS else 80
+        # DASH_QNS 已提升为模块级常量（与 QN_LABEL 同一数据源，见文件开头 QN_TABLE）
+        chosen = qn if qn in QN_LABEL else 80
         dash_qns = [q for q in DASH_QNS if q <= chosen] or [16]
         attempts = [(4048, q, f"DASH {QN_LABEL.get(q, q)}") for q in dash_qns]
         # FLV 单文件兜底（无需合并、风控宽松）；画质不超过所选上限（最低 480P）

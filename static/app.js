@@ -7,7 +7,8 @@
 // 全局状态
 let currentData = null;   // 当前搜索结果
 let currentTab = "dynamics"; // 当前选中的标签（视频标签已移除，默认「全部」）
-let cookie = "";           // SESSDATA cookie
+let cookie = "";           // 本页面持有的 SESSDATA（安全改造后通常为空，由后端兜底）
+let serverHasCookie = false; // 服务端 config.json 里是否已保存 SESSDATA（前端不再拿明文）
 let downloadTasks = {};    // 下载任务进度
 let prevActiveCount = 0;   // 上一轮"进行中"任务数（用于完成提示判定）
 let pollTimer = null;      // 轮询定时器
@@ -63,14 +64,15 @@ async function initApp() {
     cookie = saved;
     updateCookieStatus();
   }
-  // 2. 再从服务器配置文件读取（如果localStorage没有）
+  // 2. 查服务端是否已保存 SESSDATA（如果localStorage没有）
+  //    安全改造：/api/config 不再返回明文，只返回 has_sessdata / sessdata_masked。
+  //    前端保持 cookie=""，所有请求由后端从 config.json 兜底读取登录态。
   if (!cookie) {
     try {
       const resp = await fetch("/api/config");
       const data = await resp.json();
       if (data.has_sessdata) {
-        cookie = data.sessdata;
-        localStorage.setItem("bilibili_sessdata", cookie);
+        serverHasCookie = true;
         updateCookieStatus();
       }
     } catch (e) {
@@ -107,8 +109,8 @@ async function initApp() {
   //    此时「立即检查」自动下发的任务虽已写入服务端 download_tasks，
   //    但前端镜像为空 → 面板显示「暂无下载任务」。
   startPolling();
-  // 10. 首次打开且无 cookie → 弹出设置弹窗
-  if (!cookie) openCookieModal();
+  // 10. 首次打开且前后端都没有 cookie → 弹出设置弹窗
+  if (!cookie && !serverHasCookie) openCookieModal();
 }
 
 // ==================== 搜索 ====================
@@ -882,6 +884,15 @@ async function loadDynPage(page, force) {
   }
 }
 
+// 视频列表渲染后的收尾钩子。
+// 历史原因：早期「内容折叠」开关随视频 tab 一起被删，函数没了但调用点还留在
+// loadVideoPage 的两处分支里 —— 命中缓存翻页时直接 ReferenceError，渲染中断。
+// 现在保留同名函数，把真正需要的「全选栏显隐」同步回去。
+function setupContentToggles(content) {
+  updateSelectAllVisibility(currentTab);
+  return content || null;
+}
+
 async function loadVideoPage(page) {
   if (!currentUid || page < 1) return;
   const totalPages = Math.ceil(videoTotal / videoPerPage);
@@ -1576,9 +1587,18 @@ function statusNeedsFast() {
   return isDownloadPanelOpen() || hasActiveTasks();
 }
 // 自适应轮询：根据当前是否需要高频决定下次间隔
-function schedulePoll() {
+// pollGeneration 用来作废「在飞的那一轮」：kick 时自增，旧链在 finally 里发现
+// 代号不匹配就停止续期，避免同时存在两条 setTimeout 链（任务面板越开越快的经典原因）。
+let pollGeneration = 0;
+function schedulePoll(gen) {
+  if (gen === undefined) {
+    gen = ++pollGeneration;
+  } else if (gen !== pollGeneration) {
+    return;   // 旧链，已被新一轮取代
+  }
   pollStatus().finally(() => {
-    pollTimer = setTimeout(schedulePoll, statusNeedsFast() ? STATUS_FAST_MS : IDLE_POLL_MS);
+    if (gen !== pollGeneration) return;
+    pollTimer = setTimeout(() => schedulePoll(gen), statusNeedsFast() ? STATUS_FAST_MS : IDLE_POLL_MS);
   });
 }
 function startPolling() {
@@ -1587,6 +1607,7 @@ function startPolling() {
 }
 // 打开面板/刚提交任务时立即拉一次，避免最多等 IDLE_POLL_MS
 function kickStatusPoll() {
+  pollGeneration++;
   if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
   schedulePoll();
 }
@@ -2052,9 +2073,16 @@ function isAutoModalOpen() {
 function autoLogNeedsFast() {
   return autoRunning || isAutoModalOpen();
 }
-function scheduleAutoLog() {
+let autoLogGeneration = 0;   // 与 pollGeneration 同理：防止 kick 后出现两条并行的日志轮询链
+function scheduleAutoLog(gen) {
+  if (gen === undefined) {
+    gen = ++autoLogGeneration;
+  } else if (gen !== autoLogGeneration) {
+    return;
+  }
   pollAutoLog().finally(() => {
-    autoLogTimer = setTimeout(scheduleAutoLog, autoLogNeedsFast() ? AUTO_FAST_MS : IDLE_POLL_MS);
+    if (gen !== autoLogGeneration) return;
+    autoLogTimer = setTimeout(() => scheduleAutoLog(gen), autoLogNeedsFast() ? AUTO_FAST_MS : IDLE_POLL_MS);
   });
 }
 function startAutoLogPolling() {
@@ -2063,10 +2091,12 @@ function startAutoLogPolling() {
 }
 // 打开弹窗时立即拉一次，避免最多等 IDLE_POLL_MS
 function kickAutoLogPoll() {
+  autoLogGeneration++;
   if (autoLogTimer) { clearTimeout(autoLogTimer); autoLogTimer = null; }
   scheduleAutoLog();
 }
 function stopAutoLogPolling() {
+  autoLogGeneration++;   // 让在飞的一轮不再续期
   if (autoLogTimer) { clearTimeout(autoLogTimer); autoLogTimer = null; }
 }
 async function pollAutoLog() {
@@ -2313,6 +2343,9 @@ async function saveCookie() {
     localStorage.removeItem("bilibili_sessdata");
     payload.sessdata = "";
   }
+  // 同步「服务端是否已保存」标记（前端不再持有明文）
+  if (payload.sessdata) serverHasCookie = true;
+  else if (payload.sessdata === "") serverHasCookie = false;
 
   // 同时保存到服务器配置文件（跨设备持久化）
   fetch("/api/config", {
@@ -2343,6 +2376,12 @@ function updateCookieStatus() {
       statusEl.dataset.state = "checking";
       txt.textContent = "Cookie已设置·验证中";
     }
+  } else if (serverHasCookie) {
+    // 服务端有 SESSDATA，但前端不持有明文（安全改造）
+    if (statusEl.dataset.state === "empty" || !statusEl.dataset.state) {
+      statusEl.dataset.state = "checking";
+      txt.textContent = "Cookie已设置·验证中";
+    }
   } else {
     statusEl.dataset.state = "empty";
     txt.textContent = "未设置Cookie";
@@ -2366,10 +2405,9 @@ async function verifyCookie() {
       txt.textContent = "✅ 已登录";
       // cookie 重新有效后，重置"已因失效弹过窗"标记，允许下次过期再自动弹
       window.__cookieExpiredPrompted = false;
-      // 前端 cookie 为空但服务端配置有效时，同步过来（保证下载也用登录态）
+      // 服务端已保存 SESSDATA：前端不再同步明文（安全改造），后续请求留空由后端兜底
       if (!cookie && d.has_sessdata) {
-        cookie = d.sessdata;
-        localStorage.setItem("bilibili_sessdata", cookie);
+        serverHasCookie = true;
       }
     } else if (d.reason === "empty") {
       statusEl.dataset.state = "empty";
@@ -2524,28 +2562,18 @@ async function pollQr() {
       if (img) img.style.display = "none";
       if (expiredTip) expiredTip.style.display = "block";
     } else if (status === "success") {
-      // 登录成功：后端已把“纯值” sessdata 写入配置。
-      // 注意：必须用后端返回的纯值 d.sessdata 存储，绝不能把整串 d.cookie
-      // 塞进 cookieInput 再调 saveCookie()——saveCookie 会把整串（含 SESSDATA= 前缀）
-      // 写回 sessdata，覆盖掉纯值（这是此前“sessdata 仍带前缀”的根因）。
+      // 登录成功：后端已把 SESSDATA 写入 config.json，**不再回传明文**。
+      // 前端不保存 cookie，后续请求由后端兜底；这里只刷新状态与用户信息。
       stopQrPolling();
-      const sess = d.sessdata || "";
-      cookie = sess;                       // 全局 cookie 变量用纯值（与手动粘贴约定一致）
-      const input = document.getElementById("cookieInput");
-      if (input) input.value = sess;       // 输入框也只放纯值
-      // 持久化纯值到服务端（绕过 saveCookie 的整串逻辑，直接 POST 纯值）
-      try {
-        localStorage.setItem("bilibili_sessdata", sess);
-        await fetch("/api/config", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ sessdata: sess }),
-        });
-      } catch (e) { /* 忽略持久化失败 */ }
+      cookie = "";
+      serverHasCookie = d.has_sessdata !== false;
+      localStorage.removeItem("bilibili_sessdata");
       // 先提示用户“登录成功”，延迟再关弹窗，避免成功提示一闪而过
       statusEl.textContent = "🎉 登录成功！正在刷新…";
       setTimeout(async () => {
         closeQrModal();
+        updateCookieStatus();
+        verifyCookie();
         await loadSelfChip();
         if (d.self && d.self.name) {
           const chip = document.getElementById("selfChip");
@@ -2588,9 +2616,15 @@ function escapeHtml(str) {
 }
 
 function escapeAttr(str) {
-  // 强制转字符串，避免传入数字/对象等非字符串时 (str || "").replace 抛错
+  // 场景：`onclick="fn('${escapeAttr(val)}')"`——双引号属性里的单引号 JS 字符串。
+  // 必须同时满足两层：JS 层（\ 和 ' 要转义）+ HTML 属性层（" 和 & 要转义）。
+  // 以前漏了反斜杠：标题以 \ 结尾时会把结尾的 ' 吃掉，轻则语法错误点不动，重则可注入。
   const s = (str == null) ? "" : String(str);
-  return s.replace(/'/g, "\\'").replace(/"/g, "&quot;");
+  return s.replace(/&/g, "&amp;")     // 必须最先，否则会二次转义后面前面产生的实体
+          .replace(/\\/g, "\\\\")
+          .replace(/'/g, "\\'")
+          .replace(/"/g, "&quot;")
+          .replace(/\r?\n/g, " ");
 }
 
 // 安全地把值编码为「单引号 HTML 属性内的 JS 字符串字面量」：
@@ -2666,7 +2700,8 @@ function selfChipAvatarError() {
 }
 
 function openSelfView() {
-  if (!cookie) {
+  // 服务端有 SESSDATA（cookie 留空）也应允许进入，请求由后端兜底
+  if (!cookie && !serverHasCookie) {
     alert("请先在右上角『Cookie设置』中填入 SESSDATA 登录后再查看『我的』");
     openCookieModal();
     return;

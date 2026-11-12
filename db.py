@@ -7,16 +7,24 @@ db.py - 下载历史 SQLite 存储
 
 表结构：
     downloads(id, data_dyid, bvid, title, up_uid, up_name, time, created_at)
-- data_dyid / bvid 可能为 ""（空值不参与去重匹配），去重在应用层完成。
+- data_dyid / bvid 可能为 ""（空值不参与去重匹配）。
 - created_at 用于维持插入先后顺序（与原 JSON 的 append 顺序一致）。
 - 并发：所有读写串行化在 _db_lock 下，连接每次新建（SQLite 连接轻量），
   并启用 WAL + busy_timeout 避免 "database is locked"。
+
+迁移（SCHEMA_VERSION，存于 PRAGMA user_version）：
+    v1  建表 + 三个普通索引（早期版本）
+    v2  清理历史重复行，并加 uq_dyid / uq_bvid 两个**部分唯一索引**，
+        写入改为 INSERT OR IGNORE —— 从此去重由数据库兜底，不再依赖
+        「先 SELECT 再 INSERT」这种在并发下会双写的做法。
 """
 
 import os
 import time
 import sqlite3
 import threading
+
+SCHEMA_VERSION = 2
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "bili_history.db")
@@ -38,28 +46,63 @@ def _connect():
     return conn
 
 
-# ----------------------- 初始化 -----------------------
+# ----------------------- 初始化 / 迁移 -----------------------
+_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS downloads (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    data_dyid TEXT NOT NULL DEFAULT '',
+    bvid      TEXT NOT NULL DEFAULT '',
+    title     TEXT NOT NULL DEFAULT '',
+    up_uid    TEXT NOT NULL DEFAULT '',
+    up_name   TEXT NOT NULL DEFAULT '',
+    time      TEXT NOT NULL DEFAULT '',
+    created_at REAL NOT NULL
+)
+"""
+
+# 去重键：空值不参与唯一约束，故用部分索引（SQLite 3.8+ 支持）
+_UNIQUE_SQL = (
+    "CREATE UNIQUE INDEX IF NOT EXISTS uq_dyid ON downloads(data_dyid) WHERE data_dyid <> ''",
+    "CREATE UNIQUE INDEX IF NOT EXISTS uq_bvid ON downloads(bvid) WHERE bvid <> ''",
+)
+
+
+def _dedupe(conn):
+    """删除历史重复行（同一个 data_dyid 或同一个 bvid 只保留最早一条）。返回删除条数。"""
+    removed = 0
+    for col in ("data_dyid", "bvid"):
+        cur = conn.execute(
+            f"DELETE FROM downloads WHERE {col} <> '' AND id NOT IN "
+            f"(SELECT MIN(id) FROM downloads WHERE {col} <> '' GROUP BY {col})"
+        )
+        removed += cur.rowcount or 0
+    return removed
+
+
+def _migrate(conn):
+    """按 PRAGMA user_version 依次升级。幂等，可在每次启动时安全调用。"""
+    conn.execute(_SCHEMA_SQL)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_dyid ON downloads(data_dyid)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_bvid ON downloads(bvid)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_uid ON downloads(up_uid)")
+
+    version = conn.execute("PRAGMA user_version").fetchone()[0]
+    if version < 2:
+        # v1 的老库里可能存在重复行（旧去重是 SELECT-then-INSERT，并发下会漏），
+        # 先清理再加唯一索引，否则 CREATE UNIQUE INDEX 会直接报错。
+        _dedupe(conn)
+        for sql in _UNIQUE_SQL:
+            conn.execute(sql)
+        conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+    conn.commit()
+
+
 def init_db():
-    """建表并建索引。幂等，可重复调用。"""
+    """建表 + 迁移。幂等，可重复调用（每次启动都会走一遍）。"""
     with _db_lock:
         conn = _connect()
         try:
-            conn.execute(
-                """CREATE TABLE IF NOT EXISTS downloads (
-                    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                    data_dyid TEXT NOT NULL DEFAULT '',
-                    bvid      TEXT NOT NULL DEFAULT '',
-                    title     TEXT NOT NULL DEFAULT '',
-                    up_uid    TEXT NOT NULL DEFAULT '',
-                    up_name   TEXT NOT NULL DEFAULT '',
-                    time      TEXT NOT NULL DEFAULT '',
-                    created_at REAL NOT NULL
-                )"""
-            )
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_dyid ON downloads(data_dyid)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_bvid ON downloads(bvid)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_uid ON downloads(up_uid)")
-            conn.commit()
+            _migrate(conn)
         finally:
             conn.close()
 
@@ -87,23 +130,28 @@ def load_history():
 
 
 def add_to_history(data_dyid="0", bvid="0", title="", up_uid="", up_name=""):
-    """追加一条下载历史（全局去重：data-dyid 或 bvid 任一命中即跳过）。"""
+    """追加一条下载历史（data-dyid 或 bvid 任一命中即跳过）。
+
+    去重双保险：先 SELECT 预判（快，且老库没有唯一索引时仍有效），
+    再靠 INSERT OR IGNORE 让唯一索引兜底并发写入。
+    返回 True=新插入，False=已存在被忽略。"""
     did = _norm_val(data_dyid)
     bv = _norm_val(bvid)
     with _db_lock:
         conn = _connect()
         try:
             if did and conn.execute("SELECT 1 FROM downloads WHERE data_dyid=?", (did,)).fetchone():
-                return
+                return False
             if bv and conn.execute("SELECT 1 FROM downloads WHERE bvid=?", (bv,)).fetchone():
-                return
-            conn.execute(
-                "INSERT INTO downloads "
+                return False
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO downloads "
                 "(data_dyid,bvid,title,up_uid,up_name,time,created_at) "
                 "VALUES (?,?,?,?,?,?,?)",
                 (did, bv, title or "", str(up_uid or ""), up_name or "",
                  time.strftime("%Y-%m-%d %H:%M"), time.time()))
             conn.commit()
+            return (cur.rowcount or 0) > 0
         finally:
             conn.close()
 
