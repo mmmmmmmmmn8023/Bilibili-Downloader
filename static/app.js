@@ -204,15 +204,65 @@ async function searchByQuery(query) {
 }
 
 // ==================== 常用UP主 ====================
-let favUps = [];  // [{uid, name, face}]，localStorage 持久化
+// [{uid, name, face}]：以服务端 config.json 的 fav_ups 为准（按账号隔离），
+// 本地 localStorage 只做首屏缓存 —— 换浏览器/换设备登录同一账号，列表还在。
+let favUps = [];
+const FAV_UP_LIMIT = 30;
+
+function readLocalFavUps() {
+  try {
+    const arr = JSON.parse(localStorage.getItem("bilibili_fav_ups") || "[]");
+    return Array.isArray(arr) ? arr : [];
+  } catch (e) {
+    return [];
+  }
+}
+
+function normalizeFavUps(arr) {
+  return (Array.isArray(arr) ? arr : [])
+    .filter((u) => u && String(u.uid || "").trim())
+    .map((u) => ({
+      uid: String(u.uid),
+      name: u.name || ("UID:" + u.uid),
+      face: /^https?:\/\//i.test(u.face || "") ? u.face : "",
+    }))
+    .slice(-FAV_UP_LIMIT);
+}
 
 function loadFavUps() {
-  try {
-    favUps = JSON.parse(localStorage.getItem("bilibili_fav_ups") || "[]");
-  } catch (e) {
-    favUps = [];
-  }
+  favUps = normalizeFavUps(readLocalFavUps());
   renderFavUps();
+  syncFavUpsFromServer();  // 异步：以服务端为准
+}
+
+async function syncFavUpsFromServer() {
+  try {
+    const resp = await fetch("/api/config");
+    if (!resp.ok) return;
+    const cfg = await resp.json();
+    if (Array.isArray(cfg.fav_ups)) {
+      favUps = normalizeFavUps(cfg.fav_ups);
+      localStorage.setItem("bilibili_fav_ups", JSON.stringify(favUps));
+      renderFavUps();
+    } else if (favUps.length) {
+      // 老用户：服务端还没有这份列表，把本地已有的迁移上去
+      persistFavUps();
+    }
+  } catch (e) {
+    // 网络异常时继续用本地缓存
+  }
+}
+
+// 列表变化后：本地缓存 + 上报服务端（失败不影响界面使用）
+function persistFavUps() {
+  const payload = normalizeFavUps(favUps);
+  favUps = payload;
+  try { localStorage.setItem("bilibili_fav_ups", JSON.stringify(payload)); } catch (e) {}
+  fetch("/api/config", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ fav_ups: payload }),
+  }).catch(() => {});
 }
 
 function renderFavUps() {
@@ -244,8 +294,8 @@ function addUp(uid, name, face) {
   // 去重（按 uid）后置底
   favUps = favUps.filter((x) => String(x.uid) !== uid);
   favUps.push({ uid, name: name || ("UID:" + uid), face: face || "" });
-  if (favUps.length > 30) favUps = favUps.slice(-30);  // 最多保留 30 个，保留最新的末尾 30 个
-  localStorage.setItem("bilibili_fav_ups", JSON.stringify(favUps));
+  if (favUps.length > FAV_UP_LIMIT) favUps = favUps.slice(-FAV_UP_LIMIT);  // 最多保留 30 个，保留最新的末尾 30 个
+  persistFavUps();
   renderFavUps();
   showToast(existed ? "已收藏过该UP主（已置底）" : "收藏成功 · " + (name || ("UID:" + uid)));
 }
@@ -261,7 +311,7 @@ function addCurrentUp() {
 
 function removeFavUp(uid) {
   favUps = favUps.filter((x) => String(x.uid) !== String(uid));
-  localStorage.setItem("bilibili_fav_ups", JSON.stringify(favUps));
+  persistFavUps();
   renderFavUps();
 }
 
