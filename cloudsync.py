@@ -30,6 +30,8 @@ import sys
 import threading
 import time
 
+import db  # 复用 write_json_file（兼容 Docker 单文件 bind mount）
+
 # 页面里展示/校验用的常量
 APPS_ROOT = "/apps/bypy"
 REMOTE_DEFAULT = "bilibili"
@@ -107,10 +109,7 @@ class CloudSync:
         return cfg
 
     def _save(self, cfg):
-        tmp = self._config_path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, self._config_path)
+        db.write_json_file(self._config_path, cfg)
 
     def config(self):
         return self._load()

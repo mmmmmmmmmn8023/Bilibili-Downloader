@@ -18,6 +18,7 @@ db.py - 多用户存储层（SQLite）
 
 import os
 import json
+import errno
 import time
 import hashlib
 import hmac
@@ -351,11 +352,40 @@ def _read_config_file():
         return None
 
 
+def write_json_file(path, data, indent=2):
+    """原子写 JSON 文件，兼容 Docker 单文件 bind mount。
+
+    先写 <path>.tmp 再 os.replace：目标若是被 bind mount 进容器的单个文件
+    （例如 compose 里的 ./config.json:/app/config.json），rename 覆盖挂载点会
+    返回 EBUSY（Device or resource busy），因此失败时退化为原地重写。
+    原地重写丢掉了"原子替换"语义，但挂载文件只能这么改；写前已 flush+fsync，
+    崩溃最多丢一次保存。
+    """
+    text = json.dumps(data, ensure_ascii=False, indent=indent)
+    tmp = str(path) + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        return
+    except OSError as e:
+        if getattr(e, "errno", None) not in (errno.EBUSY, errno.EXDEV,
+                                             errno.EPERM, errno.EACCES):
+            raise
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+
+
 def _write_config_file(data):
-    tmp = CONFIG_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, CONFIG_FILE)
+    write_json_file(CONFIG_FILE, data)
 
 
 def _normalize_config_store(data):
